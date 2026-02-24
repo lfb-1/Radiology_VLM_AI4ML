@@ -60,3 +60,5 @@ for i, article in enumerate(articles):
         data = []
 
 print(f"Downloaded {len(articles)} articles related to chest CT imaging")
+
+DATASET_PATH = "/midtier/sablab/scratch/data/CT-RATEV2"

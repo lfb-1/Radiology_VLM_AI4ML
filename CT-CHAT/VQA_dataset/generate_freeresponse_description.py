@@ -6,6 +6,8 @@ import re
 import json
 import tqdm
 
+DATASET_PATH = "/midtier/sablab/scratch/data/CT-RATEV2"
+
 def parse_conversation(conversation_str):
     all_conversations = {}
     free_response = re.search(r'<free_response>(.*?)</free_response>', conversation_str, re.DOTALL)

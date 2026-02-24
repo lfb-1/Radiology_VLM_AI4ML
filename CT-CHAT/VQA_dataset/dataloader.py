@@ -8,6 +8,8 @@ import pandas as pd
 from monai.data import DataLoader, Dataset
 from monai.transforms import LoadImaged, AddChanneld, ScaleIntensityd, ToTensord
 
+DATASET_PATH = "/midtier/sablab/scratch/data/CT-RATEV2"
+
 def get_ctrate_file_list(image_dir, csv_path):
     # CT-RATE CSV should have columns: image_id, question, answer
     df = pd.read_csv(csv_path)

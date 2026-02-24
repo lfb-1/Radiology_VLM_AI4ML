@@ -30,6 +30,8 @@ def get_ct_dataloader(image_dir):
     loader = DataLoader(ds, batch_size=1)
     return loader
 
+DATASET_PATH = "/midtier/sablab/scratch/data/CT-RATEV2"
+
 def main():
     # 1. Load Encoders
     dinov3_encoder = Dinov3VisionEncoder()
