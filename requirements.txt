@@ -1,28 +1,40 @@
-#!/bin/bash
-#SBATCH --job-name=vlm_medical
-#SBATCH -p sablab-gpu-low
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=08:00:00
-#SBATCH --output=vlm_medical_%j.out
-#SBATCH --error=vlm_medical_%j.err
+# Python environment setup
+# Target: Python 3.9.13
+# Install PyTorch separately via: pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
 
-set -euo pipefail
-module purge
-module load anaconda3
-conda init bash
-conda activate test
+# Core ML / Training
+transformers==4.30.2
+tokenizers==0.13.3
+accelerate==0.21.0
+deepspeed==0.10.3
+peft==0.5.0
+bitsandbytes==0.41.3
 
-# Use ONLY midtier paths
-PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/AI4ML-initiative---Medical-VLM-Model
-# VENV_PY=/midtier/sablab/scratch/isg4006/VLM_Project/venv/bin/python
+# Data & Medical Imaging
+numpy==1.26.4
+pandas==2.0.3
+nibabel==5.1.0
+Pillow==10.0.0
 
-cd "$PROJECT_DIR"
-python -c "import nltk; print('nltk ok in job env')"
+# Serving
+fastapi==0.103.2
+uvicorn==0.22.0
+gradio==3.50.2
+requests==2.31.0
 
-# Current Pipeline Entry Points:
-# 1. Pre-encoding CT volumes (run first, once per dataset):
-#    python "$PROJECT_DIR/CT-CHAT/llava/serve/encode_script.py" --path /path/to/volume.nii.gz --slope 1.0 --intercept 0.0 --xy_spacing 0.7 --z_spacing 1.5
-# 2. Training (run after pre-encoding):
-python "$PROJECT_DIR/CT-CHAT/llava/train/train_mem.py"
+# Utilities
+tqdm==4.65.0
+packaging==23.2
+six==1.16.0
+
+# Visualization
+matplotlib==3.7.5
+
+# Jupyter / Notebook support
+matplotlib-inline==0.1.6
+jupyter_client==7.4.9
+ipykernel==6.25.2
+ipython==8.12.3
+debugpy==1.8.0
+traitlets==5.9.0
+pyzmq==25.1.2
