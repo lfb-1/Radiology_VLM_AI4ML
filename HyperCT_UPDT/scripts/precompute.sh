@@ -11,14 +11,14 @@
 set -euo pipefail
 module purge
 module load anaconda3
-conda init bash
+eval "$(conda shell.bash hook)"
 conda activate test
 
 # Install dependencies (confirmed working setup)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install einops open_clip_torch timm deepspeed ninja
 pip install flash-attn
-pip install transformers nibabel tqdm
+pip install "transformers>=4.56.0" nibabel tqdm
 pip install "numpy<2"
 pip install --upgrade peft
 pip install --upgrade pip wheel
@@ -30,13 +30,10 @@ cd "$PROJECT_DIR"
 python precompute_tokens.py \
     --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train \
     --output_dir ./precomputed_tokens \
-    --num_slices 32 \
-    --slice_height 518 \
-    --slice_width 518 \
-    --spatial_pool attention \
-    --temporal_pool attention \
-    --spatial_output 64 \
-    --temporal_output 8 \
-    --encoder_name facebook/dinov2-with-registers-base \
+    --num_slices 33 \
+    --slice_height 512 \
+    --slice_width 512 \
+    --cube_pool_levels 2 \
+    --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
     --lora_rank 16 \
-    --lora_alpha 32
+    --lora_scaling 1.0

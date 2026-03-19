@@ -11,14 +11,14 @@
 set -euo pipefail
 module purge
 module load anaconda3
-conda init bash
+eval "$(conda shell.bash hook)"
 conda activate test
 
 # Install dependencies (confirmed working setup)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install einops open_clip_torch timm deepspeed ninja
 pip install flash-attn
-pip install transformers nibabel tqdm
+pip install "transformers>=4.56.0" nibabel tqdm
 pip install "numpy<2"
 pip install --upgrade peft
 pip install --upgrade pip wheel
@@ -45,5 +45,6 @@ torchrun --nproc_per_node=4 train_vlm.py \
     --batch_size 1 \
     --grad_accum 8 \
     --max_length 2048 \
+    --num_task_tokens 3 \
     --bf16 \
     --attn_implementation eager

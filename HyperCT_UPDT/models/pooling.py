@@ -1,180 +1,121 @@
-"""
-Spatial and Temporal Pooling for 2D Slice-Encoded CT Tokens
+"""Cube Merge Pooling for 3D CT Token Compression
 
-Reduces the massive token count from slice-by-slice DINOv3 encoding:
-    Raw: num_slices × N_patches_per_slice × 768
-    After spatial pool: num_slices × K × 768  (K << N_patches)
-    After temporal pool: T × K × 768  (T << num_slices)
+Qwen-style 2×2×2 cube merging: groups tokens into spatial-temporal cubes
+and merges each cube to 1 token via learned linear projection.
 
-Supports:
-    Spatial:  mean, max, stride, attention
-    Temporal: mean, max, uniform sample, attention-weighted
+    Raw: num_rgb_images × N_patches_per_image × D
+    After L levels of 2×2×2 merging: reduced by 8^L total
+
+No separate spatial_output or temporal_output parameters needed —
+compression is controlled solely by num_levels.
+
+Includes ensure_length utility to pad total slices to be divisible by 3
+(since 3 consecutive slices form one RGB image).
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
 
 
-class SpatialPooler(nn.Module):
-    """Compress per-slice patch tokens spatially."""
-
-    def __init__(self, dim: int = 768, method: str = "attention",
-                 output_tokens: int = 64, num_heads: int = 8):
-        super().__init__()
-        self.method = method
-        self.output_tokens = output_tokens
-
-        if method == "attention":
-            self.queries = nn.Parameter(torch.randn(output_tokens, dim) * 0.02)
-            self.cross_attn = nn.MultiheadAttention(
-                embed_dim=dim, num_heads=num_heads, batch_first=True
-            )
-            self.norm_q = nn.LayerNorm(dim)
-            self.norm_kv = nn.LayerNorm(dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, N_patches, D) per-slice patch tokens
-        Returns:
-            pooled: (B, output_tokens, D)
-        """
-        if self.method == "mean":
-            # Reshape to grid and pool
-            B, N, D = x.shape
-            side = int(N ** 0.5)
-            stride = max(1, side // int(self.output_tokens ** 0.5))
-            x_grid = x.view(B, side, side, D)
-            x_pool = F.adaptive_avg_pool2d(
-                x_grid.permute(0, 3, 1, 2),
-                int(self.output_tokens ** 0.5)
-            )
-            return x_pool.permute(0, 2, 3, 1).reshape(B, -1, D)[:, :self.output_tokens]
-
-        elif self.method == "max":
-            B, N, D = x.shape
-            side = int(N ** 0.5)
-            x_grid = x.view(B, side, side, D)
-            x_pool = F.adaptive_max_pool2d(
-                x_grid.permute(0, 3, 1, 2),
-                int(self.output_tokens ** 0.5)
-            )
-            return x_pool.permute(0, 2, 3, 1).reshape(B, -1, D)[:, :self.output_tokens]
-
-        elif self.method == "attention":
-            B = x.shape[0]
-            q = self.norm_q(self.queries.unsqueeze(0).expand(B, -1, -1))
-            kv = self.norm_kv(x)
-            out, _ = self.cross_attn(q, kv, kv)
-            return out
-
-        elif self.method == "stride":
-            B, N, D = x.shape
-            stride = max(1, N // self.output_tokens)
-            return x[:, ::stride, :][:, :self.output_tokens]
+def ensure_length(num_slices: int, divisor: int = 3) -> int:
+    """Ensure num_slices is divisible by divisor. Rounds up if needed."""
+    if num_slices % divisor != 0:
+        num_slices = ((num_slices // divisor) + 1) * divisor
+    return num_slices
 
 
-class TemporalPooler(nn.Module):
-    """Compress across slices (depth dimension)."""
-
-    def __init__(self, dim: int = 768, method: str = "attention",
-                 output_slices: int = 8, num_heads: int = 8):
-        super().__init__()
-        self.method = method
-        self.output_slices = output_slices
-
-        if method == "attention":
-            self.queries = nn.Parameter(torch.randn(output_slices, dim) * 0.02)
-            self.cross_attn = nn.MultiheadAttention(
-                embed_dim=dim, num_heads=num_heads, batch_first=True
-            )
-            self.norm_q = nn.LayerNorm(dim)
-            self.norm_kv = nn.LayerNorm(dim)
-            self.pos_embed = nn.Parameter(torch.randn(1, 512, dim) * 0.02)
-
-    def forward(self, x: torch.Tensor, num_slices: int) -> torch.Tensor:
-        """
-        Args:
-            x: (B, num_slices * tokens_per_slice, D)
-            num_slices: number of slices
-        Returns:
-            pooled: (B, output_slices * tokens_per_slice, D) if attention
-                    or (B, output_slices * tokens_per_slice, D) if sampling
-        """
-        B, total_tokens, D = x.shape
-        tokens_per_slice = total_tokens // num_slices
-
-        if self.method == "mean":
-            x_slices = x.view(B, num_slices, tokens_per_slice, D)
-            # Group slices into output_slices bins
-            bin_size = max(1, num_slices // self.output_slices)
-            pooled = []
-            for i in range(self.output_slices):
-                start = i * bin_size
-                end = min(start + bin_size, num_slices)
-                if start >= num_slices:
-                    break
-                pooled.append(x_slices[:, start:end].mean(dim=1))
-            return torch.cat(pooled, dim=1)
-
-        elif self.method == "uniform":
-            x_slices = x.view(B, num_slices, tokens_per_slice, D)
-            indices = torch.linspace(0, num_slices - 1, self.output_slices).long()
-            selected = x_slices[:, indices]
-            return selected.reshape(B, self.output_slices * tokens_per_slice, D)
-
-        elif self.method == "attention":
-            # Add positional embeddings for depth ordering
-            pos = self.pos_embed[:, :total_tokens, :]
-            x_pos = x + pos
-
-            B_q = x.shape[0]
-            q = self.norm_q(self.queries.unsqueeze(0).expand(B_q, -1, -1))
-            kv = self.norm_kv(x_pos)
-            out, _ = self.cross_attn(q, kv, kv)
-            return out
-
-
-class HybridPooler(nn.Module):
+def pad_volume_slices(slices: torch.Tensor, target_slices: int) -> torch.Tensor:
     """
-    Two-stage hybrid pooling: spatial first, then temporal.
+    Pad or trim slice tensor to target number of slices.
 
-    Raw tokens: (num_slices × N_patches, D)
-    After spatial: (num_slices × K_spatial, D)
-    After temporal: (T × K_spatial, D) or (num_temporal_queries, D)
+    Args:
+        slices: (num_slices, H, W) or (num_slices, ...)
+        target_slices: desired number of slices (divisible by 3)
+    Returns:
+        padded: (target_slices, ...) tensor
+    """
+    current = slices.shape[0]
+    if current == target_slices:
+        return slices
+    elif current > target_slices:
+        return slices[:target_slices]
+    else:
+        pad_count = target_slices - current
+        padding = slices[-1:].expand(pad_count, *slices.shape[1:])
+        return torch.cat([slices, padding], dim=0)
+
+
+class CubePooler(nn.Module):
+    """
+    Qwen-style 2×2×2 cube merging for spatial-temporal token compression.
+
+    Groups tokens into 2(height) × 2(width) × 2(depth) cubes and merges
+    each cube to a single token via concat + linear projection.
+
+    Applied iteratively for num_levels of compression.
+    Each level reduces token count by 8×.
+
+    No spatial_output or temporal_output params — controlled by num_levels only.
     """
 
-    def __init__(self, dim: int = 768, spatial_method: str = "attention",
-                 temporal_method: str = "attention",
-                 spatial_output: int = 64, temporal_output: int = 8,
-                 num_heads: int = 8):
+    def __init__(self, dim: int = 768, num_levels: int = 2):
         super().__init__()
-        self.spatial = SpatialPooler(dim, spatial_method, spatial_output, num_heads)
-        self.temporal = TemporalPooler(dim, temporal_method, temporal_output, num_heads)
-        self.spatial_output = spatial_output
-        self.temporal_output = temporal_output
+        self.num_levels = num_levels
+        self.merge_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(dim * 8),
+                nn.Linear(dim * 8, dim),
+                nn.SiLU(),
+            )
+            for _ in range(num_levels)
+        ])
 
     def forward(self, all_slice_tokens: list) -> torch.Tensor:
         """
         Args:
             all_slice_tokens: list of (1, N_patches, D) tensors, one per slice
         Returns:
-            pooled: (1, final_tokens, D)
+            merged: (1, final_tokens, D)
         """
-        num_slices = len(all_slice_tokens)
+        D = all_slice_tokens[0].shape[-1]
+        N = all_slice_tokens[0].shape[1]
+        H = W = int(N ** 0.5)
+        assert H * W == N, (
+            f"CubePooler expects square patch grids, got H*W={H*W} != N={N}. "
+            f"Input image dimensions may not produce square patches."
+        )
 
-        # Stage 1: Spatial pooling per slice
-        spatial_pooled = []
+        # Reshape each slice to 2D grid, trim to H*W
+        grids = []
         for tokens in all_slice_tokens:
-            pooled = self.spatial(tokens)  # (1, K_spatial, D)
-            spatial_pooled.append(pooled)
+            t = tokens.squeeze(0)[:H * W]
+            grids.append(t.view(H, W, D))
 
-        # Concatenate across slices: (1, num_slices * K_spatial, D)
-        concat = torch.cat(spatial_pooled, dim=1)
+        # Stack into 5D: (1, S, H, W, D)
+        vol = torch.stack(grids, dim=0).unsqueeze(0)
 
-        # Stage 2: Temporal pooling across slices
-        output = self.temporal(concat, num_slices=num_slices)
+        for merge_layer in self.merge_layers:
+            B, S, h, w, d = vol.shape
 
-        return output
+            # Pad to even dimensions by repeating last element
+            if S % 2 != 0:
+                vol = torch.cat([vol, vol[:, -1:]], dim=1)
+                S += 1
+            if h % 2 != 0:
+                vol = torch.cat([vol, vol[:, :, -1:]], dim=2)
+                h += 1
+            if w % 2 != 0:
+                vol = torch.cat([vol, vol[:, :, :, -1:]], dim=3)
+                w += 1
+
+            # Group into 2×2×2 cubes: (B, S/2, 2, h/2, 2, w/2, 2, d)
+            vol = vol.view(B, S // 2, 2, h // 2, 2, w // 2, 2, d)
+            # Rearrange to: (B, S/2, h/2, w/2, 2, 2, 2, d)
+            vol = vol.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous()
+            # Flatten cube: (B, S/2, h/2, w/2, 8*d)
+            vol = vol.view(B, S // 2, h // 2, w // 2, 8 * d)
+            # Merge via linear projection: (B, S/2, h/2, w/2, d)
+            vol = merge_layer(vol)
+
+        B, S, H, W, D = vol.shape
+        return vol.view(B, S * H * W, D)
