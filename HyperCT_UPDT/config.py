@@ -5,8 +5,8 @@ Central config for all pipeline stages. All paths and hyperparameters
 are overridable via CLI argparse in each script.
 """
 
-from dataclasses import dataclass, field
-from typing import List, Tuple
+from dataclasses import dataclass
+from typing import Tuple
 
 
 RADIOLOGICAL_TASKS = [
@@ -20,24 +20,22 @@ RADIOLOGICAL_TASKS = [
 
 @dataclass
 class VisionConfig:
-    encoder_name: str = "facebook/dinov2-with-registers-base"
+    encoder_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     encoder_dim: int = 768
-    num_slices: int = 32
-    slice_size: Tuple[int, int] = (518, 518)
-    spatial_pool: str = "mean"
-    temporal_pool: str = "attention"
+    num_slices: int = 33  # divisible by 3
+    slice_size: Tuple[int, int] = (512, 512)  # multiple of DINOv3 patch_size=16
+    cube_pool_levels: int = 2  # 2x2x2 cube merging levels
     lora_rank: int = 16
-    lora_alpha: int = 32
+    lora_scaling: float = 1.0  # LoRA output scaling factor (reference default)
     lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(default_factory=lambda: ["qkv", "proj"])
 
 
 @dataclass
 class HyperNetConfig:
-    task_embed_dim: int = 128
-    hidden_dim: int = 256
     num_tasks: int = len(RADIOLOGICAL_TASKS)
     lora_rank: int = 16
+    latent_size: int = 128
+    head_in_size: int = 768  # matches DINOv3 feature dim (reference default)
 
 
 @dataclass
@@ -47,9 +45,6 @@ class QFormerConfig:
     num_heads: int = 12
     num_layers: int = 6
     dropout: float = 0.1
-    num_tasks: int = len(RADIOLOGICAL_TASKS)
-    tokens_per_task: int = 64
-    total_output_tokens: int = 256
 
 
 @dataclass
@@ -57,11 +52,10 @@ class VLMConfig:
     llm_name: str = "meta-llama/Llama-3.1-8B-Instruct"
     llm_hidden_size: int = 4096
     vision_dim: int = 768
-    vision_tokens: int = 256
     lora_r: int = 128
     lora_alpha: int = 256
     lora_dropout: float = 0.05
     learning_rate: float = 2e-5
     num_epochs: int = 3
-    batch_size: int = 4
+    batch_size: int = 1  # must be 1 per GPU (HyperCTVLM requires B=1)
     gradient_accumulation_steps: int = 8

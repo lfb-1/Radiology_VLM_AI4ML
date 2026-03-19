@@ -1,14 +1,22 @@
-from .encoder import DINOv3LoRAEncoder, HyperNetwork, LoRALinear
-from .pooling import SpatialPooler, TemporalPooler, HybridPooler
+from .encoder import (
+    DINOv3LoRAEncoder,
+    LoRAHypernet,
+    TaskEncoder,
+    TaskClassifier,
+    MLPResidualBlock,
+)
+from .pooling import CubePooler, ensure_length, pad_volume_slices
 from .qformer import QFormerAdapter, QFormerLayer
 
 __all__ = [
     "DINOv3LoRAEncoder",
-    "HyperNetwork",
-    "LoRALinear",
-    "SpatialPooler",
-    "TemporalPooler",
-    "HybridPooler",
+    "LoRAHypernet",
+    "TaskEncoder",
+    "TaskClassifier",
+    "MLPResidualBlock",
+    "CubePooler",
+    "ensure_length",
+    "pad_volume_slices",
     "QFormerAdapter",
     "QFormerLayer",
 ]

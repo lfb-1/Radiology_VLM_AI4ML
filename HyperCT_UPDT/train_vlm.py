@@ -20,26 +20,25 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     TrainingArguments,
     Trainer,
-    BitsAndBytesConfig,
 )
 from peft import LoraConfig, get_peft_model
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import VLMConfig, QFormerConfig, RADIOLOGICAL_TASKS
+from config import RADIOLOGICAL_TASKS
 from models.qformer import QFormerAdapter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -66,12 +65,18 @@ class VQADataset(Dataset):
     """
 
     def __init__(self, data_json: str, tokens_dir: str, tokenizer,
-                 max_length: int = 2048):
+                 max_length: int = 2048, num_task_tokens: int = 3):
         with open(data_json, "r") as f:
             self.data = json.load(f)
         self.tokens_dir = tokens_dir
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.num_task_tokens = num_task_tokens
+
+        # Llama 3.1 uses <|eot_id|> for end-of-turn, distinct from eos_token_id
+        self.eot_token_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        if self.eot_token_id is None or self.eot_token_id == tokenizer.unk_token_id:
+            self.eot_token_id = tokenizer.eos_token_id
 
     def __len__(self):
         return len(self.data)
@@ -82,8 +87,15 @@ class VQADataset(Dataset):
         # Load precomputed tokens
         npz_path = os.path.join(self.tokens_dir, item["image"])
         npz_data = np.load(npz_path, allow_pickle=True)
-        vision_tokens = torch.from_numpy(npz_data["tokens"]).float()
-        # vision_tokens: (num_tasks, T_out, 768) — flatten across tasks
+        all_tokens = npz_data["tokens"]       # (num_tasks, T_out, 768)
+        predictions = npz_data["predictions"]  # (num_tasks, num_tasks)
+
+        # Select top-k tasks by classifier confidence (diagonal logits)
+        # Diagonal[i] = how well task i's LoRA detects task i in this volume
+        diag = np.diag(predictions)
+        k = min(self.num_task_tokens, len(diag))
+        top_indices = np.argsort(diag)[-k:]  # highest-confidence tasks
+        vision_tokens = torch.from_numpy(all_tokens[top_indices]).float()
         vision_tokens = vision_tokens.reshape(-1, vision_tokens.shape[-1])
 
         # Build conversation
@@ -114,6 +126,9 @@ class VQADataset(Dataset):
 
         input_ids = torch.tensor(input_ids[:self.max_length], dtype=torch.long)
 
+        # Filter positions that survived truncation
+        image_token_positions = [p for p in image_token_positions if p < len(input_ids)]
+
         # Labels: mask everything before assistant responses
         labels = input_ids.clone()
         # Mask image tokens
@@ -124,16 +139,21 @@ class VQADataset(Dataset):
         )
         header_len = len(assistant_header)
 
-        # Simple masking: mask everything that isn't in an assistant turn
+        # Simple masking: mask everything that isn't in an assistant turn.
+        # The assistant's <|eot_id|> IS included in the loss so the model
+        # learns to produce the end-of-turn signal.
         in_assistant = False
         for i in range(len(labels)):
             if i + header_len <= len(input_ids):
                 if input_ids[i:i+header_len].tolist() == assistant_header:
                     in_assistant = True
-            if input_ids[i].item() == self.tokenizer.eos_token_id:
-                in_assistant = False
             if not in_assistant:
                 labels[i] = IGNORE_INDEX
+            # Llama 3.1: <|eot_id|> marks end-of-turn (NOT eos_token_id).
+            # Check AFTER the masking decision so eot_id in assistant
+            # turns is supervised (model learns when to stop).
+            if input_ids[i].item() == self.eot_token_id:
+                in_assistant = False
 
         return {
             "input_ids": input_ids,
@@ -173,9 +193,6 @@ def collate_fn(batch, pad_token_id: int):
     }
 
 
-import torch.nn.functional as F
-
-
 class HyperCTVLM(nn.Module):
     """
     Full VLM: Q-Former adapter + LLM.
@@ -186,62 +203,69 @@ class HyperCTVLM(nn.Module):
         3. LLM forward with modified embeddings
     """
 
-    def __init__(self, llm, qformer: QFormerAdapter, tokenizer):
+    def __init__(self, llm, qformer: QFormerAdapter):
         super().__init__()
         self.llm = llm
         self.qformer = qformer
-        self.tokenizer = tokenizer
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        """Delegate to LLM so HuggingFace Trainer can enable gradient checkpointing."""
+        self.llm.gradient_checkpointing_enable(**kwargs)
+
+    def gradient_checkpointing_disable(self):
+        self.llm.gradient_checkpointing_disable()
 
     def forward(self, input_ids, labels, attention_mask, vision_tokens, image_positions):
         device = input_ids.device
         B = input_ids.shape[0]
 
+        # Vision token injection changes sequence length per sample,
+        # so batch_size must be 1 (gradient accumulation handles effective batch).
+        assert B == 1, (
+            f"HyperCTVLM requires batch_size=1 per GPU (got {B}). "
+            "Use gradient_accumulation_steps for larger effective batch."
+        )
+
         # Get text embeddings
         text_embeds = self.llm.get_input_embeddings()(
             input_ids.clamp(min=0)  # clamp IMAGE_TOKEN_INDEX to valid range
-        )
+        )  # (1, seq_len, hidden_dim)
 
-        # Process each sample's vision tokens through Q-Former
-        for i in range(B):
-            if len(image_positions[i]) == 0:
-                continue
-
-            v_tokens = vision_tokens[i].unsqueeze(0).to(device)  # (1, N, 768)
+        if len(image_positions[0]) > 0:
+            # Process vision tokens through Q-Former
+            v_tokens = vision_tokens[0].unsqueeze(0).to(device)  # (1, N, 768)
             aligned = self.qformer(v_tokens)  # (1, num_queries, 4096)
-            aligned = aligned.squeeze(0)  # (num_queries, 4096)
-
-            # Insert vision features at image positions
-            pos = image_positions[i][0].item()
+            aligned = aligned.squeeze(0).to(text_embeds.dtype)  # (num_queries, 4096)
             num_vision = aligned.shape[0]
 
-            # Expand embeddings to accommodate vision tokens
-            pre = text_embeds[i, :pos]
-            post = text_embeds[i, pos+1:]  # skip IMAGE_TOKEN_INDEX
-            new_embeds = torch.cat([pre, aligned, post], dim=0)
+            # Replace IMAGE_TOKEN placeholder with vision features
+            pos = image_positions[0][0].item()
+            pre = text_embeds[0, :pos]           # before <image>
+            post = text_embeds[0, pos + 1:]      # after <image>
+            new_embeds = torch.cat([pre, aligned, post], dim=0).unsqueeze(0)
 
-            # Adjust labels and attention mask
-            pre_labels = labels[i, :pos]
-            post_labels = labels[i, pos+1:]
-            vision_labels = torch.full((num_vision,), IGNORE_INDEX, device=device, dtype=labels.dtype)
-            new_labels = torch.cat([pre_labels, vision_labels, post_labels])
+            # Adjust labels: mask vision token positions
+            pre_labels = labels[0, :pos]
+            post_labels = labels[0, pos + 1:]
+            vision_labels = torch.full(
+                (num_vision,), IGNORE_INDEX, device=device, dtype=labels.dtype
+            )
+            new_labels = torch.cat([pre_labels, vision_labels, post_labels]).unsqueeze(0)
 
-            pre_mask = attention_mask[i, :pos]
-            post_mask = attention_mask[i, pos+1:]
+            # Adjust attention mask
+            pre_mask = attention_mask[0, :pos]
+            post_mask = attention_mask[0, pos + 1:]
             vision_mask = torch.ones(num_vision, device=device, dtype=attention_mask.dtype)
-            new_mask = torch.cat([pre_mask, vision_mask, post_mask])
+            new_mask = torch.cat([pre_mask, vision_mask, post_mask]).unsqueeze(0)
+        else:
+            new_embeds = text_embeds
+            new_labels = labels
+            new_mask = attention_mask
 
-            # Truncate to max length
-            max_len = input_ids.shape[1] + num_vision - 1
-            text_embeds = F.pad(text_embeds, (0, 0, 0, num_vision - 1, 0, 0)) if i == 0 else text_embeds
-            # For simplicity in batch, we handle this per-sample
-            # In production, use a custom collator that pre-allocates
-
-        # For single-sample batches or uniform handling
-        # This simplified version works with gradient accumulation (batch_size=1 per GPU)
         outputs = self.llm(
-            inputs_embeds=text_embeds[:, :new_embeds.shape[0]],
-            labels=new_labels.unsqueeze(0) if B == 1 else labels,
-            attention_mask=new_mask.unsqueeze(0) if B == 1 else attention_mask,
+            inputs_embeds=new_embeds,
+            labels=new_labels,
+            attention_mask=new_mask,
         )
         return outputs
 
@@ -278,6 +302,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=2048)
+    parser.add_argument("--num_task_tokens", type=int, default=3,
+                        help="Number of top tasks to select based on classifier confidence")
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--qformer_checkpoint", type=str, default=None)
@@ -327,7 +353,8 @@ def main():
         log.info(f"Loaded Q-Former checkpoint: {args.qformer_checkpoint}")
 
     # Dataset
-    dataset = VQADataset(args.data_json, args.tokens_dir, tokenizer, args.max_length)
+    dataset = VQADataset(args.data_json, args.tokens_dir, tokenizer, args.max_length,
+                          num_task_tokens=args.num_task_tokens)
     log.info(f"Dataset: {len(dataset)} samples")
 
     # Training args
@@ -349,7 +376,7 @@ def main():
     )
 
     # Combine Q-Former + LLM into single model
-    model = HyperCTVLM(llm, qformer, tokenizer)
+    model = HyperCTVLM(llm, qformer)
 
     trainer = Trainer(
         model=model,

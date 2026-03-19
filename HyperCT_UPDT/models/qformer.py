@@ -14,7 +14,6 @@ so the Q-Former can produce task-aware representations.
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional
 
 
