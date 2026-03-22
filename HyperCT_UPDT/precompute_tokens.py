@@ -119,6 +119,7 @@ def precompute_single_volume(
 ) -> dict:
     """
     Precompute vision tokens for one CT volume, all tasks.
+    Uses forward_with_lora for manual LoRA injection per task.
     Also runs classifier per task.
 
     Returns:
