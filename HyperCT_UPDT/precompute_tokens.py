@@ -214,7 +214,7 @@ def main():
 
     pooler.eval()
 
-    nifti_files = sorted(Path(args.data_dir).glob("*.nii.gz"))
+    nifti_files = sorted(Path(args.data_dir).rglob("*.nii.gz"))
     log.info(f"Found {len(nifti_files)} volumes in {args.data_dir}")
 
     slice_size = (args.slice_height, args.slice_width)
