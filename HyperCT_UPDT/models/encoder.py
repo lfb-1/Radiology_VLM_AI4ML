@@ -301,10 +301,10 @@ class TaskClassifier(nn.Module):
 
 class DINOv3LoRAEncoder(nn.Module):
     """
-    DINOv3 ViT-B encoder with HyperNetwork-generated task-specific LoRA.
+    DINOv2 ViT-B encoder with HyperNetwork-generated task-specific LoRA.
 
-    Uses facebook/dinov3-vitb16-pretrain-lvd1689m (arXiv 2508.10104).
-    DINOv3 architecture: RoPE, pre-norm, layer scale, drop path.
+    Uses facebook/dinov2-base (public model).
+    DINOv2 architecture: RoPE, pre-norm, layer scale, drop path.
 
     Follows HyperCT reference architecture:
         - Frozen backbone (requires_grad=False prevents pretrained weight
@@ -316,7 +316,7 @@ class DINOv3LoRAEncoder(nn.Module):
         - TaskClassifier for training the hypernet via backprop
     """
 
-    def __init__(self, encoder_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
+    def __init__(self, encoder_name: str = "facebook/dinov2-base",
                  num_tasks: int = 18, lora_rank: int = 16, lora_scaling: float = 1.0,
                  latent_size: int = 128, head_in_size: int = 768):
         super().__init__()
