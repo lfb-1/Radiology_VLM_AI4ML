@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd \"/Users/ishitagupta/Documents/VLM AI4ml/HyperCT_UPDT\" && python -m py_compile models/encoder\\.py && echo \"encoder\\.py OK\" && python -m py_compile config\\.py && echo \"config\\.py OK\" && python -m py_compile models/pooling\\.py && echo \"pooling\\.py OK\" && python -m py_compile models/qformer\\.py && echo \"qformer\\.py OK\" && python -m py_compile precompute_tokens\\.py && echo \"precompute_tokens\\.py OK\" && python -m py_compile train_vlm\\.py && echo \"train_vlm\\.py OK\" && python -m py_compile models/__init__\\.py && echo \"__init__\\.py OK\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

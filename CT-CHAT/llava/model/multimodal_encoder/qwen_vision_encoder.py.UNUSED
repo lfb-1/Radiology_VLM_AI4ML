@@ -7,8 +7,8 @@ import numpy as np
 class Dinov3VisionEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitb16-pretrain-lvd1689m")
-        self.model = AutoModel.from_pretrained("facebook/dinov3-vitb16-pretrain-lvd1689m").eval()
+        self.processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+        self.model = AutoModel.from_pretrained("facebook/dinov2-base").eval()
 
     def forward(self, x):
         # x: (B, C, D, H, W) or (B, T, C, D, H, W)

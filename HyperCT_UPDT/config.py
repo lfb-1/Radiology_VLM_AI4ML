@@ -20,7 +20,7 @@ RADIOLOGICAL_TASKS = [
 
 @dataclass
 class VisionConfig:
-    encoder_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+    encoder_name: str = "facebook/dinov2-base"
     encoder_dim: int = 768
     num_slices: int = 33  # divisible by 3
     slice_size: Tuple[int, int] = (512, 512)  # multiple of DINOv3 patch_size=16

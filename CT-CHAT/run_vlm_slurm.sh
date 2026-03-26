@@ -21,6 +21,7 @@ PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/AI4ML-initiative---Medic
 cd "$PROJECT_DIR"
 python -c "import nltk; print('nltk ok in job env')"
 
+
 # 1. Pre-encoding CT volumes (run first, once per dataset):
 #    python "$PROJECT_DIR/CT-CHAT/llava/serve/encode_script.py" --path /path/to/volume.nii.gz --slope 1.0 --intercept 0.0 --xy_spacing 0.7 --z_spacing 1.5
 # 2. Training (run after pre-encoding):
