@@ -176,7 +176,7 @@ def main():
     parser.add_argument("--slice_height", type=int, default=512)
     parser.add_argument("--slice_width", type=int, default=512)
     parser.add_argument("--cube_pool_levels", type=int, default=2)
-    parser.add_argument("--encoder_name", type=str, default="facebook/dinov2-base")
+    parser.add_argument("--encoder_name", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_scaling", type=float, default=1.0)
     args = parser.parse_args()

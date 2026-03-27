@@ -34,6 +34,6 @@ python precompute_tokens.py \
     --slice_height 512 \
     --slice_width 512 \
     --cube_pool_levels 2 \
-    --encoder_name facebook/dinov2-base \
+    --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
     --lora_rank 16 \
     --lora_scaling 1.0

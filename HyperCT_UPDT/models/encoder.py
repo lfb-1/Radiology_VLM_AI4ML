@@ -301,10 +301,10 @@ class TaskClassifier(nn.Module):
 
 class DINOv3LoRAEncoder(nn.Module):
     """
-    DINOv2 ViT-B encoder with HyperNetwork-generated task-specific LoRA.
+    DINOv3 ViT-B encoder with HyperNetwork-generated task-specific LoRA.
 
-    Uses facebook/dinov2-base (public model).
-    DINOv2 architecture: RoPE, pre-norm, layer scale, drop path.
+    Uses facebook/dinov3-vitb16-pretrain-lvd1689m (arXiv 2508.10104).
+    DINOv3 architecture: RoPE, pre-norm, layer scale, drop path.
 
     Follows HyperCT reference architecture:
         - Frozen backbone (requires_grad=False prevents pretrained weight
@@ -316,7 +316,7 @@ class DINOv3LoRAEncoder(nn.Module):
         - TaskClassifier for training the hypernet via backprop
     """
 
-    def __init__(self, encoder_name: str = "facebook/dinov2-base",
+    def __init__(self, encoder_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
                  num_tasks: int = 18, lora_rank: int = 16, lora_scaling: float = 1.0,
                  latent_size: int = 128, head_in_size: int = 768):
         super().__init__()
@@ -346,7 +346,7 @@ class DINOv3LoRAEncoder(nn.Module):
         out_features = {}
 
         # Attention modules: q_proj, k_proj, v_proj, o_proj
-        sample_attn = self.encoder.blocks[0].attn
+        sample_attn = self.encoder.encoder.layer[0].attention
         for module_type in ["q_proj", "k_proj", "v_proj"]:
             proj = getattr(sample_attn, module_type)
             target_modules.append(module_type)
@@ -358,13 +358,13 @@ class DINOv3LoRAEncoder(nn.Module):
         out_features["o_proj"] = sample_attn.o_proj.out_features
 
         # MLP modules: up_proj, down_proj (HyperCT reference: mlp_up, mlp_down)
-        sample_mlp = self.encoder.blocks[0].mlp
-        assert hasattr(sample_mlp, 'up_proj'), f"DINOv2 MLP missing up_proj: {type(sample_mlp)}"
-        assert hasattr(sample_mlp, 'down_proj'), f"DINOv2 MLP missing down_proj: {type(sample_mlp)}"
-        assert hasattr(sample_mlp, 'act_fn'), f"DINOv2 MLP missing act_fn: {type(sample_mlp)}"
-        # Dinov2 MLP may have gate_proj for SwiGLU, but we keep the check for now
+        sample_mlp = self.encoder.encoder.layer[0].mlp
+        assert hasattr(sample_mlp, 'up_proj'), f"DINOv3 MLP missing up_proj: {type(sample_mlp)}"
+        assert hasattr(sample_mlp, 'down_proj'), f"DINOv3 MLP missing down_proj: {type(sample_mlp)}"
+        assert hasattr(sample_mlp, 'act_fn'), f"DINOv3 MLP missing act_fn: {type(sample_mlp)}"
+        # DINOv3 MLP may have gate_proj for SwiGLU, but we keep the check for now
         assert not hasattr(sample_mlp, 'gate_proj'), (
-            f"DINOv2 MLP has gate_proj (SwiGLU). The manual MLP decomposition "
+            f"DINOv3 MLP has gate_proj (SwiGLU). The manual MLP decomposition "
             f"(up_proj → act_fn → down_proj) does not handle gating. "
             f"Add gate_proj LoRA support before proceeding.")
 
@@ -375,7 +375,7 @@ class DINOv3LoRAEncoder(nn.Module):
             out_features[module_type] = proj.out_features
 
         self.target_module_names = target_modules
-        self.num_encoder_layers = len(self.encoder.blocks)
+        self.num_encoder_layers = len(self.encoder.encoder.layer)
 
         # HyperNetwork with layer depth/type encoders (HyperCT architecture)
         self.hypernet = LoRAHypernet(
@@ -451,8 +451,8 @@ class DINOv3LoRAEncoder(nn.Module):
         # RoPE position embeddings (computed from pixel_values shape)
         cos, sin = self.encoder.rope_embeddings(pixel_values)
 
-        for i, layer in enumerate(self.encoder.blocks):
-            attn = layer.attn
+        for i, layer in enumerate(self.encoder.encoder.layer):
+            attn = layer.attention
             num_heads = attn.num_heads
             head_dim = attn.head_dim
             Bs, N, D = hidden.shape
@@ -531,7 +531,7 @@ class DINOv3LoRAEncoder(nn.Module):
             hidden = layer.drop_path(layer.layer_scale2(mlp_out)) + residual
 
         # Final layernorm
-        hidden = self.encoder.norm(hidden)
+        hidden = self.encoder.layernorm(hidden)
 
         # Drop CLS + register tokens, return only patch tokens
         return hidden[:, 1 + self.num_register_tokens:, :]
