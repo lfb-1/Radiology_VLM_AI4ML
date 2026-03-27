@@ -32,7 +32,7 @@ python train_hypernet.py \
     --labels_json /midtier/sablab/scratch/isg4006/VLM_Project/data/labels_train.json \
     --val_labels_json /midtier/sablab/scratch/isg4006/VLM_Project/data/labels_val.json \
     --output_dir ./checkpoints/hypernet \
-    --encoder_name facebook/dinov2-base \
+    --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
     --lora_rank 16 \
     --lora_scaling 1.0 \
     --num_slices 33 \

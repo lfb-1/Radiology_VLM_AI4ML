@@ -380,7 +380,7 @@ def main():
                         help="Optional validation labels JSON")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/hypernet")
     parser.add_argument("--encoder_name", type=str,
-                        default="facebook/dinov2-base")
+                        default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_scaling", type=float, default=1.0)
     parser.add_argument("--num_slices", type=int, default=33)
