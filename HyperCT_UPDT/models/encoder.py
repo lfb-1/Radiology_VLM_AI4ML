@@ -346,7 +346,7 @@ class DINOv3LoRAEncoder(nn.Module):
         out_features = {}
 
         # Attention modules: q_proj, k_proj, v_proj, o_proj
-        sample_attn = self.encoder.layer[0].attention
+        sample_attn = self.encoder.blocks[0].attn
         for module_type in ["q_proj", "k_proj", "v_proj"]:
             proj = getattr(sample_attn, module_type)
             target_modules.append(module_type)
@@ -358,12 +358,13 @@ class DINOv3LoRAEncoder(nn.Module):
         out_features["o_proj"] = sample_attn.o_proj.out_features
 
         # MLP modules: up_proj, down_proj (HyperCT reference: mlp_up, mlp_down)
-        sample_mlp = self.encoder.model.layer[0].mlp
-        assert hasattr(sample_mlp, 'up_proj'), f"DINOv3 MLP missing up_proj: {type(sample_mlp)}"
-        assert hasattr(sample_mlp, 'down_proj'), f"DINOv3 MLP missing down_proj: {type(sample_mlp)}"
-        assert hasattr(sample_mlp, 'act_fn'), f"DINOv3 MLP missing act_fn: {type(sample_mlp)}"
+        sample_mlp = self.encoder.blocks[0].mlp
+        assert hasattr(sample_mlp, 'up_proj'), f"DINOv2 MLP missing up_proj: {type(sample_mlp)}"
+        assert hasattr(sample_mlp, 'down_proj'), f"DINOv2 MLP missing down_proj: {type(sample_mlp)}"
+        assert hasattr(sample_mlp, 'act_fn'), f"DINOv2 MLP missing act_fn: {type(sample_mlp)}"
+        # Dinov2 MLP may have gate_proj for SwiGLU, but we keep the check for now
         assert not hasattr(sample_mlp, 'gate_proj'), (
-            f"DINOv3 MLP has gate_proj (SwiGLU). The manual MLP decomposition "
+            f"DINOv2 MLP has gate_proj (SwiGLU). The manual MLP decomposition "
             f"(up_proj → act_fn → down_proj) does not handle gating. "
             f"Add gate_proj LoRA support before proceeding.")
 
@@ -374,7 +375,7 @@ class DINOv3LoRAEncoder(nn.Module):
             out_features[module_type] = proj.out_features
 
         self.target_module_names = target_modules
-        self.num_encoder_layers = len(self.encoder.model.layer)
+        self.num_encoder_layers = len(self.encoder.blocks)
 
         # HyperNetwork with layer depth/type encoders (HyperCT architecture)
         self.hypernet = LoRAHypernet(
@@ -450,8 +451,8 @@ class DINOv3LoRAEncoder(nn.Module):
         # RoPE position embeddings (computed from pixel_values shape)
         cos, sin = self.encoder.rope_embeddings(pixel_values)
 
-        for i, layer in enumerate(self.encoder.model.layer):
-            attn = layer.attention
+        for i, layer in enumerate(self.encoder.blocks):
+            attn = layer.attn
             num_heads = attn.num_heads
             head_dim = attn.head_dim
             Bs, N, D = hidden.shape
