@@ -5,19 +5,19 @@ Trains the HyperNetwork + TaskClassifier on labeled CT data so that
 task-specific LoRA weights improve downstream classification.
 
 Architecture (following HyperCT reference github.com/lfb-1/HyperCT):
-    - DINOv3 backbone: FROZEN (requires_grad=False)
-    - HyperNetwork: TRAINABLE — generates LoRA A/B per task per layer
-    - TaskClassifier: TRAINABLE — multi-label BCE supervision
+    - DINOv2 backbone: FROZEN (requires_grad=False)
+    - HyperNetwork: TRAINABLE -- generates LoRA A/B per task per layer
+    - TaskClassifier: TRAINABLE -- multi-label BCE supervision
     - LoRA injection: via forward hooks (HookBasedLoRAManager)
 
 Training loop per epoch:
     For each CT volume batch:
         1. Sample one task per volume from multi-label ground truth
         2. Generate LoRA weights via HyperNetwork for that task
-        3. Apply LoRA via hooks → forward DINOv3 → patch tokens
-        4. Global pool → TaskClassifier → logits
+        3. Apply LoRA via hooks -> forward DINOv2 -> patch tokens
+        4. Global pool -> TaskClassifier -> logits
         5. BCEWithLogitsLoss against multi-label targets
-        6. Backward through: loss → classifier → features → LoRA → hypernet
+        6. Backward through: loss -> classifier -> features -> LoRA -> hypernet
 
 Data format:
     JSON list of dicts:
@@ -50,7 +50,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import RADIOLOGICAL_TASKS
-from models.encoder import DINOv3LoRAEncoder
+from models.encoder import DINOv2LoRAEncoder
 from models.lora_hooks import dynamic_lora_context
 from models.pooling import ensure_length, pad_volume_slices
 
@@ -87,7 +87,7 @@ class CTMultiLabelDataset(Dataset):
         return len(self.records)
 
     def _load_volume(self, path: str) -> torch.Tensor:
-        """Load NIfTI, HU window, resample → (num_slices, H, W)."""
+        """Load NIfTI, HU window, resample -> (num_slices, H, W)."""
         nii = nib.load(path)
         vol = nii.get_fdata().astype(np.float32)
         vol = np.clip(vol, self.hu_min, self.hu_max)
@@ -176,7 +176,7 @@ def sample_task_per_sample(labels: torch.Tensor, valid_mask: torch.Tensor):
 
 
 def train_one_epoch(
-    encoder: DINOv3LoRAEncoder,
+    encoder: DINOv2LoRAEncoder,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     dataloader: DataLoader,
@@ -190,7 +190,7 @@ def train_one_epoch(
     - Base model stays frozen (.eval())
     - HyperNetwork + TaskClassifier are trainable (.train())
     """
-    encoder.encoder.eval()          # DINOv3 backbone frozen
+    encoder.encoder.eval()          # DINOv2 backbone frozen
     encoder.hypernet.train()        # HyperNetwork trainable
     encoder.classifier.train()      # Classifier trainable
 
@@ -227,48 +227,50 @@ def train_one_epoch(
                 lora_mgr.set_lora_weights(lora_w)
                 lora_mgr.activate()
 
-                # Forward through DINOv3 with hooks applying LoRA
+                # Forward through DINOv2 with hooks applying LoRA
                 normalized = encoder.preprocess(single_pv)
-                hidden = encoder.encoder.embeddings(normalized)
-                cos, sin = encoder.encoder.rope_embeddings(normalized)
 
-                for layer in encoder.encoder.model.layer:
-                    attn = layer.attention
-                    num_heads = attn.num_heads
-                    head_dim = attn.head_dim
+                # DINOv2 embeddings (includes CLS + positional embeddings)
+                hidden = encoder.encoder.embeddings(normalized)
+
+                for layer in encoder.encoder.encoder.layer:
+                    self_attn = layer.attention.attention
+                    self_output = layer.attention.output
+                    num_heads = self_attn.num_attention_heads
+                    head_dim = self_attn.attention_head_size
                     Bs, N, D = hidden.shape
 
                     residual = hidden
                     hidden_normed = layer.norm1(hidden)
 
-                    q = attn.q_proj(hidden_normed)
-                    k = attn.k_proj(hidden_normed)
-                    v = attn.v_proj(hidden_normed)
+                    q = self_attn.query(hidden_normed)
+                    k = self_attn.key(hidden_normed)
+                    v = self_attn.value(hidden_normed)
 
                     q = q.view(Bs, N, num_heads, head_dim).transpose(1, 2)
                     k = k.view(Bs, N, num_heads, head_dim).transpose(1, 2)
                     v = v.view(Bs, N, num_heads, head_dim).transpose(1, 2)
 
-                    q, k = encoder._apply_rotary_pos_emb(q, k, cos, sin)
-
+                    # Scaled dot-product attention (no RoPE in DINOv2)
                     attn_w = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)
                     attn_w = attn_w.softmax(dim=-1)
                     attn_out = (attn_w @ v).transpose(1, 2).reshape(Bs, N, D)
 
-                    proj_out = attn.o_proj(attn_out)
+                    proj_out = self_output.dense(attn_out)
+                    proj_out = self_output.dropout(proj_out)
                     hidden = layer.drop_path(layer.layer_scale1(proj_out)) + residual
 
                     residual = hidden
                     hidden_normed = layer.norm2(hidden)
-                    up_out = layer.mlp.up_proj(hidden_normed)
-                    up_out = layer.mlp.act_fn(up_out)
-                    mlp_out = layer.mlp.down_proj(up_out)
+                    fc1_out = layer.mlp.fc1(hidden_normed)
+                    fc1_out = layer.mlp.activation(fc1_out)
+                    mlp_out = layer.mlp.fc2(fc1_out)
                     hidden = layer.drop_path(layer.layer_scale2(mlp_out)) + residual
 
-                hidden = encoder.encoder.norm(hidden)
+                hidden = encoder.encoder.layernorm(hidden)
 
-                # Drop CLS + register tokens
-                patch_tokens = hidden[:, 1 + encoder.num_register_tokens:, :]
+                # Drop CLS token (index 0), return only patch tokens
+                patch_tokens = hidden[:, 1:, :]
                 lora_mgr.deactivate()
 
                 # Classify from pooled features
@@ -295,14 +297,14 @@ def train_one_epoch(
                          f"Loss {loss.item():.4f} | Valid {pv.shape[0]}")
 
     avg_loss = total_loss / max(num_batches, 1)
-    log.info(f"Epoch {epoch} complete — avg loss: {avg_loss:.4f}, "
+    log.info(f"Epoch {epoch} complete -- avg loss: {avg_loss:.4f}, "
              f"valid samples: {num_valid}")
     return avg_loss
 
 
 @torch.no_grad()
 def evaluate(
-    encoder: DINOv3LoRAEncoder,
+    encoder: DINOv2LoRAEncoder,
     criterion: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
@@ -380,7 +382,7 @@ def main():
                         help="Optional validation labels JSON")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/hypernet")
     parser.add_argument("--encoder_name", type=str,
-                        default="facebook/dinov3-vitb16-pretrain-lvd1689m")
+                        default="facebook/dinov2-base")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_scaling", type=float, default=1.0)
     parser.add_argument("--num_slices", type=int, default=33)
@@ -407,8 +409,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Model
-    log.info(f"Initializing DINOv3 encoder: {args.encoder_name}")
-    encoder = DINOv3LoRAEncoder(
+    log.info(f"Initializing DINOv2 encoder: {args.encoder_name}")
+    encoder = DINOv2LoRAEncoder(
         encoder_name=args.encoder_name,
         num_tasks=len(RADIOLOGICAL_TASKS),
         lora_rank=args.lora_rank,

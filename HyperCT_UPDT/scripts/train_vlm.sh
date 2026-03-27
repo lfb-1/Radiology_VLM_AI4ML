@@ -18,7 +18,7 @@ conda activate test
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install einops open_clip_torch timm deepspeed ninja
 pip install flash-attn
-pip install "transformers>=4.56.0" nibabel tqdm
+pip install "transformers>=4.34.0" nibabel tqdm
 pip install "numpy<2"
 pip install --upgrade peft
 pip install --upgrade pip wheel

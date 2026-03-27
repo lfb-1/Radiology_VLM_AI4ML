@@ -1,17 +1,17 @@
 """Precompute Vision Tokens for HyperCT_UPDT Pipeline
 
-Processes 3D CT volumes (.nii.gz) through DINOv3 ViT-B + task-specific
+Processes 3D CT volumes (.nii.gz) through DINOv2 ViT-B + task-specific
 LoRA and saves pooled vision tokens as .npz files for downstream training.
 
-Uses facebook/dinov3-vitb16-pretrain-lvd1689m (arXiv 2508.10104).
+Uses facebook/dinov2-base.
 Follows HyperCT reference architecture (github.com/lfb-1/HyperCT).
 
 Pipeline per volume (following HyperCT reference architecture):
     1. Load .nii.gz -> HU windowing -> ensure_length(divisible by 3) -> slice
     2. Group 3 consecutive slices into RGB images (R=slice_i, G=slice_{i+1},
-       B=slice_{i+2}) — provides inter-slice anatomical context
+       B=slice_{i+2}) -- provides inter-slice anatomical context
     3. For each task (18 radiological labels):
-        a. Encode RGB images: DINOv3 + task LoRA -> patch tokens
+        a. Encode RGB images: DINOv2 + task LoRA -> patch tokens
         b. 2x2x2 cube pooling -> compressed tokens
     4. Run classifier on pooled features per task
     5. Save tokens + predictions as .npz
@@ -39,7 +39,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import RADIOLOGICAL_TASKS
-from models.encoder import DINOv3LoRAEncoder
+from models.encoder import DINOv2LoRAEncoder
 from models.pooling import CubePooler, ensure_length, pad_volume_slices
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -111,7 +111,7 @@ def slices_to_rgb(volume_slices: torch.Tensor, group_idx: int) -> torch.Tensor:
 
 def precompute_single_volume(
     volume_path: str,
-    encoder: DINOv3LoRAEncoder,
+    encoder: DINOv2LoRAEncoder,
     pooler: CubePooler,
     num_slices: int,
     slice_size: tuple,
@@ -148,7 +148,7 @@ def precompute_single_volume(
             tokens = encoder.forward_with_lora(pixel_values, lora_weights)  # (1, N_patches, 768)
             slice_tokens.append(tokens)
 
-        # 2×2×2 cube pooling
+        # 2x2x2 cube pooling
         pooled = pooler(slice_tokens)  # (1, final_tokens, D)
 
         # Classifier prediction from each task's LoRA-adapted features
@@ -176,7 +176,7 @@ def main():
     parser.add_argument("--slice_height", type=int, default=512)
     parser.add_argument("--slice_width", type=int, default=512)
     parser.add_argument("--cube_pool_levels", type=int, default=2)
-    parser.add_argument("--encoder_name", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m")
+    parser.add_argument("--encoder_name", type=str, default="facebook/dinov2-base")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_scaling", type=float, default=1.0)
     args = parser.parse_args()
@@ -188,8 +188,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    log.info("Initializing DINOv3 encoder with HyperNetwork...")
-    encoder = DINOv3LoRAEncoder(
+    log.info("Initializing DINOv2 encoder with HyperNetwork...")
+    encoder = DINOv2LoRAEncoder(
         encoder_name=args.encoder_name,
         num_tasks=len(RADIOLOGICAL_TASKS),
         lora_rank=args.lora_rank,
@@ -233,7 +233,7 @@ def main():
             )
 
         np.savez_compressed(out_path, **result)
-        log.info(f"Saved {out_path} — tokens shape {result['tokens'].shape}")
+        log.info(f"Saved {out_path} -- tokens shape {result['tokens'].shape}")
 
     log.info("Precomputation complete.")
 

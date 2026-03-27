@@ -1,5 +1,5 @@
 from .encoder import (
-    DINOv3LoRAEncoder,
+    DINOv2LoRAEncoder,
     LoRAHypernet,
     TaskEncoder,
     TaskClassifier,
@@ -10,7 +10,7 @@ from .qformer import QFormerAdapter, QFormerLayer
 from .lora_hooks import HookBasedLoRAManager, dynamic_lora_context
 
 __all__ = [
-    "DINOv3LoRAEncoder",
+    "DINOv2LoRAEncoder",
     "LoRAHypernet",
     "TaskEncoder",
     "TaskClassifier",

@@ -1,15 +1,16 @@
 """
-DINOv3 Vision Encoder with HyperNetwork-Generated Task-Specific LoRA
+DINOv2 Vision Encoder with HyperNetwork-Generated Task-Specific LoRA
 
-Uses facebook/dinov3-vitb16-pretrain-lvd1689m from HuggingFace (transformers >= 4.56.0).
-DINOv3 architecture (arXiv 2508.10104) with RoPE, layer scale, and drop path.
+Uses facebook/dinov2-base from HuggingFace (transformers >= 4.34.0).
+DINOv2 architecture: learned absolute positional embeddings, pre-norm,
+layer scale, drop path.
 
 Architecture:
-    3 consecutive CT slices → RGB image → DINOv3 ViT-B → patch tokens
-    HyperNetwork(task_one_hot + layer_depth + layer_type) → LoRA weights
-    LoRA applied per layer: attention (q_proj, k_proj, v_proj, o_proj)
-                          + MLP (up_proj, down_proj)
-    TaskClassifier(pooled features) → task predictions
+    3 consecutive CT slices -> RGB image -> DINOv2 ViT-B -> patch tokens
+    HyperNetwork(task_one_hot + layer_depth + layer_type) -> LoRA weights
+    LoRA applied per layer: attention (query, key, value, output_dense)
+                          + MLP (fc1, fc2)
+    TaskClassifier(pooled features) -> task predictions
 
 Key design from HyperCT reference (github.com/lfb-1/HyperCT):
     - TaskEncoder: frozen one-hot task embeddings (NOT learnable nn.Embedding)
@@ -25,7 +26,7 @@ requires_grad_(False) on the backbone IS necessary:
     - Gradients still flow THROUGH frozen layers for hypernet updates
 
 References:
-    - DINOv3: https://arxiv.org/abs/2508.10104
+    - DINOv2: https://arxiv.org/abs/2304.07193
     - HyperCT: https://github.com/lfb-1/HyperCT
     - LoRA: https://arxiv.org/abs/2106.09685
 """
@@ -40,7 +41,7 @@ from typing import Dict, List, Optional, Tuple
 class TaskEncoder(nn.Module):
     """
     Encodes task identity via frozen one-hot vectors through an MLP.
-    One-hot embeddings are NOT learnable — only the MLP projection trains.
+    One-hot embeddings are NOT learnable -- only the MLP projection trains.
     From HyperCT reference: TaskEncoder class.
     """
 
@@ -53,7 +54,7 @@ class TaskEncoder(nn.Module):
         )
 
     def forward(self, task_idx: torch.Tensor) -> torch.Tensor:
-        # Frozen one-hot — no gradients through the one-hot itself
+        # Frozen one-hot -- no gradients through the one-hot itself
         one_hot = torch.eye(self.num_tasks, device=task_idx.device,
                             dtype=torch.float32)[task_idx]
         return self.mlp(one_hot)
@@ -90,9 +91,9 @@ class LoRAHypernet(nn.Module):
     Generates task-specific LoRA weights conditioned on:
         - Frozen one-hot task embedding (via TaskEncoder)
         - Layer depth embedding (which transformer layer)
-        - Layer type embedding (which module: q/k/v/o_proj, up/down_proj)
+        - Layer type embedding (which module: query/key/value/output_dense, fc1/fc2)
 
-    Processes through mixer → residual MLPs → per-module output heads.
+    Processes through mixer -> residual MLPs -> per-module output heads.
     Initializes LoRA_B bias to zero so delta_W = B*A starts at 0.
 
     Follows HyperCT reference: 6 target modules (4 attention + 2 MLP).
@@ -179,7 +180,7 @@ class LoRAHypernet(nn.Module):
             output_size = self.split_shapes[module][0] + self.split_shapes[module][1]
 
             layer = nn.Linear(head_in_size, output_size, bias=True)
-            # LoRA_A: small random init; LoRA_B: zero init → delta_W starts at 0
+            # LoRA_A: small random init; LoRA_B: zero init -> delta_W starts at 0
             nn.init.normal_(layer.weight, std=0.01)
             with torch.no_grad():
                 split_size_A = self.split_shapes[module][0]
@@ -225,7 +226,7 @@ class LoRAHypernet(nn.Module):
 
         Args:
             layer_indices: (N,) layer indices
-            layer_type: target module name (q_proj/k_proj/v_proj/o_proj/up_proj/down_proj)
+            layer_type: target module name (query/key/value/output_dense/fc1/fc2)
             task_idx: (1,) or (N,) task index
         Returns:
             A_matrices: (N, rank, in_feat)
@@ -275,7 +276,7 @@ class TaskClassifier(nn.Module):
     and produces task predictions. Used to train the HyperNetwork.
 
     The classifier receives features from a task-specific LoRA pass,
-    and gradients flow back through: classifier → features → LoRA → hypernet.
+    and gradients flow back through: classifier -> features -> LoRA -> hypernet.
     """
 
     def __init__(self, input_dim: int = 768, num_tasks: int = 18,
@@ -299,12 +300,13 @@ class TaskClassifier(nn.Module):
         return self.classifier(features)
 
 
-class DINOv3LoRAEncoder(nn.Module):
+class DINOv2LoRAEncoder(nn.Module):
     """
-    DINOv3 ViT-B encoder with HyperNetwork-generated task-specific LoRA.
+    DINOv2 ViT-B encoder with HyperNetwork-generated task-specific LoRA.
 
-    Uses facebook/dinov3-vitb16-pretrain-lvd1689m (arXiv 2508.10104).
-    DINOv3 architecture: RoPE, pre-norm, layer scale, drop path.
+    Uses facebook/dinov2-base (public model).
+    DINOv2 architecture: learned positional embeddings, pre-norm, layer scale,
+    drop path.
 
     Follows HyperCT reference architecture:
         - Frozen backbone (requires_grad=False prevents pretrained weight
@@ -312,22 +314,22 @@ class DINOv3LoRAEncoder(nn.Module):
           layers to update the hypernet)
         - LoRAHypernet with layer depth/type encoders
         - Frozen one-hot task embeddings (via TaskEncoder)
-        - 6 LoRA targets: attention q/k/v/o_proj + MLP up/down_proj
+        - 6 LoRA targets: attention query/key/value/output_dense + MLP fc1/fc2
         - TaskClassifier for training the hypernet via backprop
     """
 
-    def __init__(self, encoder_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m",
+    def __init__(self, encoder_name: str = "facebook/dinov2-base",
                  num_tasks: int = 18, lora_rank: int = 16, lora_scaling: float = 1.0,
                  latent_size: int = 128, head_in_size: int = 768):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(encoder_name)
 
-        # Freeze backbone — required to prevent pretrained weight corruption
+        # Freeze backbone -- required to prevent pretrained weight corruption
         # and save GPU memory. Only hypernet + classifier are trainable.
         # Gradients still flow through frozen layers for hypernet updates.
         self.encoder.requires_grad_(False)
 
-        # ImageNet normalization (matches HyperCT reference: DINOv3_Encoder.preprocess)
+        # ImageNet normalization (matches HyperCT reference)
         self.preprocess = transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225],
@@ -337,38 +339,34 @@ class DINOv3LoRAEncoder(nn.Module):
         self.lora_scaling = lora_scaling
         self.scaling = lora_scaling  # Reference uses scaling_factor=1.0 directly
 
-        # Read register tokens from model config
-        self.num_register_tokens = getattr(self.encoder.config, 'num_register_tokens', 4)
+        # DINOv2-base has no register tokens
+        self.num_register_tokens = 0
 
         # Identify target modules: attention + MLP (6 modules, matching HyperCT reference)
         target_modules = []
         in_features = {}
         out_features = {}
 
-        # Attention modules: q_proj, k_proj, v_proj, o_proj
-        sample_attn = self.encoder.encoder.layer[0].attention
-        for module_type in ["q_proj", "k_proj", "v_proj"]:
-            proj = getattr(sample_attn, module_type)
+        # Attention modules: query, key, value (via Dinov2SelfAttention)
+        sample_self_attn = self.encoder.encoder.layer[0].attention.attention
+        for module_type in ["query", "key", "value"]:
+            proj = getattr(sample_self_attn, module_type)
             target_modules.append(module_type)
             in_features[module_type] = proj.in_features
             out_features[module_type] = proj.out_features
 
-        target_modules.append("o_proj")
-        in_features["o_proj"] = sample_attn.o_proj.in_features
-        out_features["o_proj"] = sample_attn.o_proj.out_features
+        # Output projection (via Dinov2SelfOutput)
+        sample_output = self.encoder.encoder.layer[0].attention.output
+        target_modules.append("output_dense")
+        in_features["output_dense"] = sample_output.dense.in_features
+        out_features["output_dense"] = sample_output.dense.out_features
 
-        # MLP modules: up_proj, down_proj (HyperCT reference: mlp_up, mlp_down)
+        # MLP modules: fc1, fc2
         sample_mlp = self.encoder.encoder.layer[0].mlp
-        assert hasattr(sample_mlp, 'up_proj'), f"DINOv3 MLP missing up_proj: {type(sample_mlp)}"
-        assert hasattr(sample_mlp, 'down_proj'), f"DINOv3 MLP missing down_proj: {type(sample_mlp)}"
-        assert hasattr(sample_mlp, 'act_fn'), f"DINOv3 MLP missing act_fn: {type(sample_mlp)}"
-        # DINOv3 MLP may have gate_proj for SwiGLU, but we keep the check for now
-        assert not hasattr(sample_mlp, 'gate_proj'), (
-            f"DINOv3 MLP has gate_proj (SwiGLU). The manual MLP decomposition "
-            f"(up_proj → act_fn → down_proj) does not handle gating. "
-            f"Add gate_proj LoRA support before proceeding.")
+        assert hasattr(sample_mlp, 'fc1'), f"DINOv2 MLP missing fc1: {type(sample_mlp)}"
+        assert hasattr(sample_mlp, 'fc2'), f"DINOv2 MLP missing fc2: {type(sample_mlp)}"
 
-        for module_type in ["up_proj", "down_proj"]:
+        for module_type in ["fc1", "fc2"]:
             proj = getattr(sample_mlp, module_type)
             target_modules.append(module_type)
             in_features[module_type] = proj.in_features
@@ -389,52 +387,23 @@ class DINOv3LoRAEncoder(nn.Module):
             out_features=out_features,
         )
 
-        # Classifier — takes LoRA-adapted features, trains the hypernet
-        encoder_dim = sample_attn.q_proj.out_features
+        # Classifier -- takes LoRA-adapted features, trains the hypernet
+        encoder_dim = sample_self_attn.query.out_features
         self.classifier = TaskClassifier(encoder_dim, num_tasks)
-
-    @staticmethod
-    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        """Rotate half of the hidden dims — standard RoPE helper."""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    def _apply_rotary_pos_emb(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply RoPE to patch tokens only, leaving CLS/register tokens unchanged."""
-        num_tokens = q.shape[-2]
-        num_patches = cos.shape[-2]
-        num_prefix = num_tokens - num_patches
-
-        q_prefix, q_patches = q.split((num_prefix, num_patches), dim=-2)
-        k_prefix, k_patches = k.split((num_prefix, num_patches), dim=-2)
-
-        q_patches = (q_patches * cos) + (self._rotate_half(q_patches) * sin)
-        k_patches = (k_patches * cos) + (self._rotate_half(k_patches) * sin)
-
-        q = torch.cat((q_prefix, q_patches), dim=-2)
-        k = torch.cat((k_prefix, k_patches), dim=-2)
-        return q, k
 
     def forward_with_lora(self, pixel_values: torch.Tensor,
                           lora_weights: Dict[str, Dict[str, torch.Tensor]]
                           ) -> torch.Tensor:
         """
-        Forward pass with task-specific LoRA applied per DINOv3 layer.
+        Forward pass with task-specific LoRA applied per DINOv2 layer.
 
-        DINOv3 layer structure: norm1 → attention(q/k/v/o_proj + RoPE) →
-            layer_scale1 → drop_path → norm2 → MLP(up_proj, down_proj) →
-            layer_scale2 → drop_path
+        DINOv2 layer structure: norm1 -> attention(query/key/value + output.dense) ->
+            layer_scale1 -> drop_path -> norm2 -> MLP(fc1, activation, fc2) ->
+            layer_scale2 -> drop_path
 
         LoRA targets (6 modules per layer, matching HyperCT reference):
-            attention: q_proj, k_proj, v_proj, o_proj (768→768)
-            MLP: up_proj (768→3072), down_proj (3072→768)
+            attention: query, key, value (768->768), output_dense (768->768)
+            MLP: fc1 (768->3072), fc2 (3072->768)
 
         Args:
             pixel_values: (B, 3, H, W) values in [0, 1]
@@ -445,16 +414,14 @@ class DINOv3LoRAEncoder(nn.Module):
         # ImageNet normalization (HyperCT reference: self.preprocess)
         pixel_values = self.preprocess(pixel_values)
 
-        # DINOv3 embeddings: CLS + register_tokens + patch_tokens
+        # DINOv2 embeddings: CLS + patch_tokens (includes positional embeddings)
         hidden = self.encoder.embeddings(pixel_values)
 
-        # RoPE position embeddings (computed from pixel_values shape)
-        cos, sin = self.encoder.rope_embeddings(pixel_values)
-
         for i, layer in enumerate(self.encoder.encoder.layer):
-            attn = layer.attention
-            num_heads = attn.num_heads
-            head_dim = attn.head_dim
+            self_attn = layer.attention.attention
+            self_output = layer.attention.output
+            num_heads = self_attn.num_attention_heads
+            head_dim = self_attn.attention_head_size
             Bs, N, D = hidden.shape
 
             # --- Attention block (pre-norm) ---
@@ -462,11 +429,11 @@ class DINOv3LoRAEncoder(nn.Module):
             hidden_normed = layer.norm1(hidden)
 
             # Q, K, V with separate per-module LoRA
-            q = attn.q_proj(hidden_normed)
-            k = attn.k_proj(hidden_normed)
-            v = attn.v_proj(hidden_normed)
+            q = self_attn.query(hidden_normed)
+            k = self_attn.key(hidden_normed)
+            v = self_attn.value(hidden_normed)
 
-            for module_name, label in [("q_proj", "q"), ("k_proj", "k"), ("v_proj", "v")]:
+            for module_name, label in [("query", "q"), ("key", "k"), ("value", "v")]:
                 if module_name in lora_weights:
                     A = lora_weights[module_name]["lora_A"][i]
                     B_mat = lora_weights[module_name]["lora_B"][i]
@@ -480,61 +447,60 @@ class DINOv3LoRAEncoder(nn.Module):
                     else:
                         v = v + delta
 
-            # Multi-head reshape: (B, N, D) → (B, num_heads, N, head_dim)
+            # Multi-head reshape: (B, N, D) -> (B, num_heads, N, head_dim)
             q = q.view(Bs, N, num_heads, head_dim).transpose(1, 2)
             k = k.view(Bs, N, num_heads, head_dim).transpose(1, 2)
             v = v.view(Bs, N, num_heads, head_dim).transpose(1, 2)
 
-            # Apply RoPE (patch tokens only, not CLS/register)
-            q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
-
-            # Scaled dot-product attention
+            # Scaled dot-product attention (no RoPE in DINOv2)
             attn_w = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)
             attn_w = attn_w.softmax(dim=-1)
             attn_out = (attn_w @ v).transpose(1, 2).reshape(Bs, N, D)
 
             # Output projection with LoRA
-            proj_out = attn.o_proj(attn_out)
-            if "o_proj" in lora_weights:
-                pA = lora_weights["o_proj"]["lora_A"][i]
-                pB = lora_weights["o_proj"]["lora_B"][i]
+            proj_out = self_output.dense(attn_out)
+            if "output_dense" in lora_weights:
+                pA = lora_weights["output_dense"]["lora_A"][i]
+                pB = lora_weights["output_dense"]["lora_B"][i]
                 pA = pA.to(attn_out.device, dtype=attn_out.dtype)
                 pB = pB.to(attn_out.device, dtype=attn_out.dtype)
                 proj_out = proj_out + (attn_out @ pA.T) @ pB.T * self.scaling
 
+            proj_out = self_output.dropout(proj_out)
+
             # Layer scale + drop path + residual
             hidden = layer.drop_path(layer.layer_scale1(proj_out)) + residual
 
-            # --- MLP block (pre-norm), with LoRA on up_proj and down_proj ---
+            # --- MLP block (pre-norm), with LoRA on fc1 and fc2 ---
             residual = hidden
             hidden_normed = layer.norm2(hidden)
 
             # Decompose MLP forward to apply per-module LoRA (HyperCT reference)
-            up_out = layer.mlp.up_proj(hidden_normed)
-            if "up_proj" in lora_weights:
-                uA = lora_weights["up_proj"]["lora_A"][i]
-                uB = lora_weights["up_proj"]["lora_B"][i]
+            fc1_out = layer.mlp.fc1(hidden_normed)
+            if "fc1" in lora_weights:
+                uA = lora_weights["fc1"]["lora_A"][i]
+                uB = lora_weights["fc1"]["lora_B"][i]
                 uA = uA.to(hidden_normed.device, dtype=hidden_normed.dtype)
                 uB = uB.to(hidden_normed.device, dtype=hidden_normed.dtype)
-                up_out = up_out + (hidden_normed @ uA.T) @ uB.T * self.scaling
+                fc1_out = fc1_out + (hidden_normed @ uA.T) @ uB.T * self.scaling
 
-            up_out = layer.mlp.act_fn(up_out)
+            fc1_out = layer.mlp.activation(fc1_out)
 
-            mlp_out = layer.mlp.down_proj(up_out)
-            if "down_proj" in lora_weights:
-                dA = lora_weights["down_proj"]["lora_A"][i]
-                dB = lora_weights["down_proj"]["lora_B"][i]
-                dA = dA.to(up_out.device, dtype=up_out.dtype)
-                dB = dB.to(up_out.device, dtype=up_out.dtype)
-                mlp_out = mlp_out + (up_out @ dA.T) @ dB.T * self.scaling
+            mlp_out = layer.mlp.fc2(fc1_out)
+            if "fc2" in lora_weights:
+                dA = lora_weights["fc2"]["lora_A"][i]
+                dB = lora_weights["fc2"]["lora_B"][i]
+                dA = dA.to(fc1_out.device, dtype=fc1_out.dtype)
+                dB = dB.to(fc1_out.device, dtype=fc1_out.dtype)
+                mlp_out = mlp_out + (fc1_out @ dA.T) @ dB.T * self.scaling
 
             hidden = layer.drop_path(layer.layer_scale2(mlp_out)) + residual
 
         # Final layernorm
         hidden = self.encoder.layernorm(hidden)
 
-        # Drop CLS + register tokens, return only patch tokens
-        return hidden[:, 1 + self.num_register_tokens:, :]
+        # Drop CLS token (index 0), return only patch tokens
+        return hidden[:, 1:, :]
 
     def encode_slice(self, pixel_values: torch.Tensor,
                      task_id: torch.Tensor) -> torch.Tensor:

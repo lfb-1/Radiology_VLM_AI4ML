@@ -20,10 +20,10 @@ RADIOLOGICAL_TASKS = [
 
 @dataclass
 class VisionConfig:
-    encoder_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+    encoder_name: str = "facebook/dinov2-base"
     encoder_dim: int = 768
     num_slices: int = 33  # divisible by 3
-    slice_size: Tuple[int, int] = (512, 512)  # multiple of DINOv3 patch_size=16
+    slice_size: Tuple[int, int] = (512, 512)  # multiple of DINOv2 patch_size=14
     cube_pool_levels: int = 2  # 2x2x2 cube merging levels
     lora_rank: int = 16
     lora_scaling: float = 1.0  # LoRA output scaling factor (reference default)
@@ -35,7 +35,7 @@ class HyperNetConfig:
     num_tasks: int = len(RADIOLOGICAL_TASKS)
     lora_rank: int = 16
     latent_size: int = 128
-    head_in_size: int = 768  # matches DINOv3 feature dim (reference default)
+    head_in_size: int = 768  # matches DINOv2 feature dim (reference default)
 
 
 @dataclass

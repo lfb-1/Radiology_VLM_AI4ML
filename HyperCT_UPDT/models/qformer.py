@@ -1,7 +1,7 @@
 """
 Q-Former Adapter for Vision-Language Alignment
 
-Bridges pooled DINOv3 vision tokens (768-dim) to LLM hidden space (4096-dim).
+Bridges pooled DINOv2 vision tokens (768-dim) to LLM hidden space (4096-dim).
 Uses learnable query tokens with cross-attention to vision features, followed
 by a linear projection to the LLM's input dimension.
 

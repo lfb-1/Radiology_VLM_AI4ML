@@ -1,5 +1,5 @@
 """
-Hook-Based LoRA Manager for DINOv3 with HyperNetwork
+Hook-Based LoRA Manager for DINOv2 with HyperNetwork
 
 Applies dynamic LoRA weights via forward hooks instead of monkey-patching.
 Adapted from HyperCT reference (github.com/lfb-1/HyperCT) lora_hooks.py.
@@ -8,31 +8,31 @@ Key design:
     - Register forward hooks on all 6 target Linear layers per encoder layer
     - Hooks intercept output and add  scaling * (input @ A^T) @ B^T
     - Activate/deactivate cleanly; no permanent model modification
-    - Supports per-layer indexing via DINOv3 encoder.model.layer[i] structure
+    - Supports per-layer indexing via DINOv2 encoder.encoder.layer[i] structure
 """
 
 import torch
 import torch.nn as nn
 from contextlib import contextmanager
-from typing import Dict, Optional
+from typing import Dict
 import logging
 
 log = logging.getLogger(__name__)
 
-# Maps DINOv3 module path suffixes to our hypernet target names
+# Maps DINOv2 module path suffixes to our hypernet target names
 _MODULE_NAME_MAP = {
-    "attention.q_proj": "q_proj",
-    "attention.k_proj": "k_proj",
-    "attention.v_proj": "v_proj",
-    "attention.o_proj": "o_proj",
-    "mlp.up_proj": "up_proj",
-    "mlp.down_proj": "down_proj",
+    "attention.attention.query": "query",
+    "attention.attention.key": "key",
+    "attention.attention.value": "value",
+    "attention.output.dense": "output_dense",
+    "mlp.fc1": "fc1",
+    "mlp.fc2": "fc2",
 }
 
 
 class HookBasedLoRAManager:
     """
-    Manages dynamic LoRA via forward hooks on DINOv3 Linear layers.
+    Manages dynamic LoRA via forward hooks on DINOv2 Linear layers.
 
     Usage:
         manager = HookBasedLoRAManager(encoder, scaling=1.0)
@@ -54,9 +54,9 @@ class HookBasedLoRAManager:
 
     def _parse_layer_and_module(self, full_name: str):
         """
-        Parse DINOv3 module path to extract layer index and target name.
+        Parse DINOv2 module path to extract layer index and target name.
 
-        DINOv3 paths look like: encoder.model.layer.{i}.attention.q_proj
+        DINOv2 paths look like: encoder.layer.{i}.attention.attention.query
         """
         parts = full_name.split(".")
         layer_idx = None
@@ -108,7 +108,7 @@ class HookBasedLoRAManager:
         return hook_fn
 
     def register_hooks(self):
-        """Register forward hooks on all target Linear layers in DINOv3."""
+        """Register forward hooks on all target Linear layers in DINOv2."""
         self.remove_hooks()
         for name, module in self.encoder.named_modules():
             if not isinstance(module, nn.Linear):

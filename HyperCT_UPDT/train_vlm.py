@@ -1,7 +1,7 @@
 """
 VLM Training Script for HyperCT_UPDT Pipeline
 
-Trains a Vision-Language Model using precomputed DINOv3 vision tokens:
+Trains a Vision-Language Model using precomputed DINOv2 vision tokens:
     1. Load precomputed tokens (.npz) per CT volume
     2. Pass through Q-Former adapter → (num_queries, 4096)
     3. Inject into Llama 3.1 8B at IMAGE_TOKEN positions

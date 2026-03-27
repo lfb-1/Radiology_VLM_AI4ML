@@ -18,7 +18,7 @@ conda activate test
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install einops open_clip_torch timm deepspeed ninja
 pip install flash-attn --no-build-isolation
-pip install "transformers>=4.56.0" nibabel tqdm
+pip install "transformers>=4.34.0" nibabel tqdm
 pip install "numpy<2"
 pip install --upgrade peft
 pip install --upgrade pip wheel
@@ -32,7 +32,7 @@ python train_hypernet.py \
     --labels_json /midtier/sablab/scratch/isg4006/VLM_Project/data/labels_train.json \
     --val_labels_json /midtier/sablab/scratch/isg4006/VLM_Project/data/labels_val.json \
     --output_dir ./checkpoints/hypernet \
-    --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
+    --encoder_name facebook/dinov2-base \
     --lora_rank 16 \
     --lora_scaling 1.0 \
     --num_slices 33 \
