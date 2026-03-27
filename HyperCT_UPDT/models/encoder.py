@@ -346,7 +346,7 @@ class DINOv3LoRAEncoder(nn.Module):
         out_features = {}
 
         # Attention modules: q_proj, k_proj, v_proj, o_proj
-        sample_attn = self.encoder.model.layer[0].attention
+        sample_attn = self.encoder.layer[0].attention
         for module_type in ["q_proj", "k_proj", "v_proj"]:
             proj = getattr(sample_attn, module_type)
             target_modules.append(module_type)
