@@ -8,7 +8,7 @@ Key design:
     - Register forward hooks on all 6 target Linear layers per encoder layer
     - Hooks intercept output and add  scaling * (input @ A^T) @ B^T
     - Activate/deactivate cleanly; no permanent model modification
-    - Supports per-layer indexing via DINOv3 encoder.model.layer[i] structure
+    - Supports per-layer indexing via DINOv3 transformer layer structure
 """
 
 import torch
@@ -56,7 +56,7 @@ class HookBasedLoRAManager:
         """
         Parse DINOv3 module path to extract layer index and target name.
 
-        DINOv3 paths look like: encoder.model.layer.{i}.attention.q_proj
+        DINOv3 paths look like: *.layer.{i}.attention.q_proj
         """
         parts = full_name.split(".")
         layer_idx = None

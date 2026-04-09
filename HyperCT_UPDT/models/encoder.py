@@ -340,13 +340,20 @@ class DINOv3LoRAEncoder(nn.Module):
         # Read register tokens from model config
         self.num_register_tokens = getattr(self.encoder.config, 'num_register_tokens', 4)
 
+        # Discover transformer layer list regardless of HuggingFace model wrapper attribute name.
+        # DINOv2 wraps as .encoder.layer, DINOv3ViTModel may use .model.layer, .vit.layer, etc.
+        self._transformer_layers = self._find_transformer_layers(self.encoder)
+
+        # Discover final norm layer (varies: .norm, .layernorm, .post_layernorm, etc.)
+        self._norm_layer = self._find_norm_layer(self.encoder)
+
         # Identify target modules: attention + MLP (6 modules, matching HyperCT reference)
         target_modules = []
         in_features = {}
         out_features = {}
 
         # Attention modules: q_proj, k_proj, v_proj, o_proj
-        sample_attn = self.encoder.model.layer[0].attention
+        sample_attn = self._transformer_layers[0].attention
         for module_type in ["q_proj", "k_proj", "v_proj"]:
             proj = getattr(sample_attn, module_type)
             target_modules.append(module_type)
@@ -358,7 +365,7 @@ class DINOv3LoRAEncoder(nn.Module):
         out_features["o_proj"] = sample_attn.o_proj.out_features
 
         # MLP modules: up_proj, down_proj (HyperCT reference: mlp_up, mlp_down)
-        sample_mlp = self.encoder.model.layer[0].mlp
+        sample_mlp = self._transformer_layers[0].mlp
         assert hasattr(sample_mlp, 'up_proj'), f"DINOv3 MLP missing up_proj: {type(sample_mlp)}"
         assert hasattr(sample_mlp, 'down_proj'), f"DINOv3 MLP missing down_proj: {type(sample_mlp)}"
         assert hasattr(sample_mlp, 'act_fn'), f"DINOv3 MLP missing act_fn: {type(sample_mlp)}"
@@ -374,7 +381,7 @@ class DINOv3LoRAEncoder(nn.Module):
             out_features[module_type] = proj.out_features
 
         self.target_module_names = target_modules
-        self.num_encoder_layers = len(self.encoder.model.layer)
+        self.num_encoder_layers = len(self._transformer_layers)
 
         # HyperNetwork with layer depth/type encoders (HyperCT architecture)
         self.hypernet = LoRAHypernet(
@@ -391,6 +398,64 @@ class DINOv3LoRAEncoder(nn.Module):
         # Classifier — takes LoRA-adapted features, trains the hypernet
         encoder_dim = sample_attn.q_proj.out_features
         self.classifier = TaskClassifier(encoder_dim, num_tasks)
+
+    @staticmethod
+    def _find_transformer_layers(encoder):
+        """Discover transformer layer ModuleList regardless of HuggingFace wrapper attribute name.
+
+        Tries common attribute paths in order:
+            encoder.model.layer  (DINOv3ViTModel style)
+            encoder.encoder.layer (Dinov2Model / BertModel style)
+            encoder.vit.encoder.layer (ViTModel style)
+            encoder.vit.layer
+            encoder.layer (direct)
+        Raises a descriptive AttributeError if none match.
+        """
+        candidates = [
+            lambda m: m.model.layer,
+            lambda m: m.encoder.layer,
+            lambda m: m.vit.encoder.layer,
+            lambda m: m.vit.layer,
+            lambda m: m.layer,
+        ]
+        for getter in candidates:
+            try:
+                layers = getter(encoder)
+                if layers is not None and len(layers) > 0:
+                    return layers
+            except AttributeError:
+                continue
+        available = [name for name, _ in encoder.named_children()]
+        raise AttributeError(
+            f"Cannot find transformer layers in {type(encoder).__name__}. "
+            f"Top-level children: {available}"
+        )
+
+    @staticmethod
+    def _find_norm_layer(encoder):
+        """Discover the final LayerNorm regardless of HuggingFace attribute name.
+
+        HF models vary: .norm, .layernorm, .post_layernorm, .model.norm, etc.
+        """
+        candidates = [
+            lambda m: m.norm,
+            lambda m: m.layernorm,
+            lambda m: m.post_layernorm,
+            lambda m: m.model.norm,
+            lambda m: m.model.layernorm,
+        ]
+        for getter in candidates:
+            try:
+                layer = getter(encoder)
+                if layer is not None and isinstance(layer, nn.Module):
+                    return layer
+            except AttributeError:
+                continue
+        available = [name for name, _ in encoder.named_children()]
+        raise AttributeError(
+            f"Cannot find final norm layer in {type(encoder).__name__}. "
+            f"Top-level children: {available}"
+        )
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -450,7 +515,7 @@ class DINOv3LoRAEncoder(nn.Module):
         # RoPE position embeddings (computed from pixel_values shape)
         cos, sin = self.encoder.rope_embeddings(pixel_values)
 
-        for i, layer in enumerate(self.encoder.model.layer):
+        for i, layer in enumerate(self._transformer_layers):
             attn = layer.attention
             num_heads = attn.num_heads
             head_dim = attn.head_dim
@@ -530,7 +595,7 @@ class DINOv3LoRAEncoder(nn.Module):
             hidden = layer.drop_path(layer.layer_scale2(mlp_out)) + residual
 
         # Final layernorm
-        hidden = self.encoder.norm(hidden)
+        hidden = self._norm_layer(hidden)
 
         # Drop CLS + register tokens, return only patch tokens
         return hidden[:, 1 + self.num_register_tokens:, :]

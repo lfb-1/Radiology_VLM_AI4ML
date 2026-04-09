@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=hyperct_train_hypernet
-#SBATCH -p sablab-gpu-low
+#SBATCH -p sablab-gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -24,7 +24,7 @@ pip install --upgrade peft
 pip install --upgrade pip wheel
 pip install --force-reinstall --no-deps markupsafe==3.0.3
 
-PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HyperCT_UPDT
+PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HRadiology_VLM_AI4ML/HyperCT_UPDT
 cd "$PROJECT_DIR"
 
 python train_hypernet.py \

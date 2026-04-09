@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=hyperct_train_vlm
-#SBATCH -p sablab-gpu-low
+#SBATCH -p sablab-gpu
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
@@ -24,7 +24,7 @@ pip install --upgrade peft
 pip install --upgrade pip wheel
 pip install --force-reinstall --no-deps markupsafe==3.0.3
 
-PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HyperCT_UPDT
+PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HRadiology_VLM_AI4ML/HyperCT_UPDT
 cd "$PROJECT_DIR"
 
 torchrun --nproc_per_node=4 train_vlm.py \
