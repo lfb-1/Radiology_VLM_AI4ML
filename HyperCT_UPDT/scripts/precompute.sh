@@ -9,6 +9,7 @@
 #SBATCH --error=hyperct_precompute_%j.err
 
 set -euo pipefail
+
 module purge
 module load anaconda3
 eval "$(conda shell.bash hook)"
@@ -17,7 +18,7 @@ conda activate test
 # Install dependencies (confirmed working setup)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install einops open_clip_torch timm deepspeed ninja
-pip install flash-attn
+pip install flash-attn --no-build-isolation
 pip install "transformers>=4.56.0" nibabel tqdm
 pip install "numpy<2"
 pip install --upgrade peft
@@ -28,11 +29,12 @@ PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HRad
 cd "$PROJECT_DIR"
 
 python precompute_tokens.py \
-    --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train \
+    --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train_fixed \
     --output_dir ./precomputed_tokens \
+    --checkpoint ./checkpoints/hypernet/best_checkpoint.pth \
     --num_slices 33 \
-    --slice_height 512 \
-    --slice_width 512 \
+    --slice_height 224 \
+    --slice_width 224 \
     --cube_pool_levels 2 \
     --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
     --lora_rank 16 \

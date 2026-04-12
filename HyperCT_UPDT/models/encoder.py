@@ -32,6 +32,7 @@ References:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import transforms
 from transformers import AutoModel
 from typing import Dict, List, Optional, Tuple
@@ -347,6 +348,12 @@ class DINOv3LoRAEncoder(nn.Module):
         # Discover final norm layer (varies: .norm, .layernorm, .post_layernorm, etc.)
         self._norm_layer = self._find_norm_layer(self.encoder)
 
+        # Discover patch embeddings module
+        self._embeddings = self._find_embeddings(self.encoder)
+
+        # Discover RoPE embeddings (may be None if model doesn't use RoPE)
+        self._rope_embeddings = self._find_rope_embeddings(self.encoder)
+
         # Identify target modules: attention + MLP (6 modules, matching HyperCT reference)
         target_modules = []
         in_features = {}
@@ -458,6 +465,54 @@ class DINOv3LoRAEncoder(nn.Module):
         )
 
     @staticmethod
+    def _find_embeddings(encoder):
+        """Discover the patch embedding module.
+
+        HF models vary: .embeddings, .model.embeddings, .vit.embeddings, etc.
+        """
+        candidates = [
+            lambda m: m.embeddings,
+            lambda m: m.model.embeddings,
+            lambda m: m.vit.embeddings,
+            lambda m: m.patch_embeddings,
+        ]
+        for getter in candidates:
+            try:
+                emb = getter(encoder)
+                if emb is not None and isinstance(emb, nn.Module):
+                    return emb
+            except AttributeError:
+                continue
+        available = [name for name, _ in encoder.named_children()]
+        raise AttributeError(
+            f"Cannot find embeddings in {type(encoder).__name__}. "
+            f"Top-level children: {available}"
+        )
+
+    @staticmethod
+    def _find_rope_embeddings(encoder):
+        """Discover the RoPE embedding module/callable.
+
+        Returns the callable, or None if model doesn't use RoPE.
+        HF paths: .rope_embeddings, .model.rope_embeddings, .rotary_embeddings.
+        """
+        candidates = [
+            lambda m: m.rope_embeddings,
+            lambda m: m.model.rope_embeddings,
+            lambda m: m.rotary_embeddings,
+            lambda m: m.model.rotary_embeddings,
+        ]
+        for getter in candidates:
+            try:
+                rope = getter(encoder)
+                if rope is not None:
+                    return rope
+            except AttributeError:
+                continue
+        # RoPE is optional — some ViT models use learned position embeddings
+        return None
+
+    @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
         """Rotate half of the hidden dims — standard RoPE helper."""
         x1 = x[..., : x.shape[-1] // 2]
@@ -510,10 +565,24 @@ class DINOv3LoRAEncoder(nn.Module):
         pixel_values = self.preprocess(pixel_values)
 
         # DINOv3 embeddings: CLS + register_tokens + patch_tokens
-        hidden = self.encoder.embeddings(pixel_values)
+        hidden = self._embeddings(pixel_values)
 
         # RoPE position embeddings (computed from pixel_values shape)
-        cos, sin = self.encoder.rope_embeddings(pixel_values)
+        if self._rope_embeddings is not None:
+            cos, sin = self._rope_embeddings(pixel_values)
+        else:
+            cos, sin = None, None
+
+        # Pre-cast all LoRA weights to the hidden state device/dtype once,
+        # avoiding 72 redundant .to() calls inside the layer loop.
+        target_device, target_dtype = hidden.device, hidden.dtype
+        lora_weights = {
+            mod: {
+                "lora_A": w["lora_A"].to(device=target_device, dtype=target_dtype),
+                "lora_B": w["lora_B"].to(device=target_device, dtype=target_dtype),
+            }
+            for mod, w in lora_weights.items()
+        }
 
         for i, layer in enumerate(self._transformer_layers):
             attn = layer.attention
@@ -534,8 +603,6 @@ class DINOv3LoRAEncoder(nn.Module):
                 if module_name in lora_weights:
                     A = lora_weights[module_name]["lora_A"][i]
                     B_mat = lora_weights[module_name]["lora_B"][i]
-                    A = A.to(hidden_normed.device, dtype=hidden_normed.dtype)
-                    B_mat = B_mat.to(hidden_normed.device, dtype=hidden_normed.dtype)
                     delta = (hidden_normed @ A.T) @ B_mat.T * self.scaling
                     if label == "q":
                         q = q + delta
@@ -550,20 +617,19 @@ class DINOv3LoRAEncoder(nn.Module):
             v = v.view(Bs, N, num_heads, head_dim).transpose(1, 2)
 
             # Apply RoPE (patch tokens only, not CLS/register)
-            q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
+            if cos is not None and sin is not None:
+                q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
 
-            # Scaled dot-product attention
-            attn_w = (q @ k.transpose(-2, -1)) * (head_dim ** -0.5)
-            attn_w = attn_w.softmax(dim=-1)
-            attn_out = (attn_w @ v).transpose(1, 2).reshape(Bs, N, D)
+            # Flash-Attention / memory-efficient attention via PyTorch SDPA.
+            # Automatically selects Flash Attention 2 on CUDA when available.
+            attn_out = F.scaled_dot_product_attention(q, k, v)
+            attn_out = attn_out.transpose(1, 2).reshape(Bs, N, D)
 
             # Output projection with LoRA
             proj_out = attn.o_proj(attn_out)
             if "o_proj" in lora_weights:
                 pA = lora_weights["o_proj"]["lora_A"][i]
                 pB = lora_weights["o_proj"]["lora_B"][i]
-                pA = pA.to(attn_out.device, dtype=attn_out.dtype)
-                pB = pB.to(attn_out.device, dtype=attn_out.dtype)
                 proj_out = proj_out + (attn_out @ pA.T) @ pB.T * self.scaling
 
             # Layer scale + drop path + residual
@@ -578,8 +644,6 @@ class DINOv3LoRAEncoder(nn.Module):
             if "up_proj" in lora_weights:
                 uA = lora_weights["up_proj"]["lora_A"][i]
                 uB = lora_weights["up_proj"]["lora_B"][i]
-                uA = uA.to(hidden_normed.device, dtype=hidden_normed.dtype)
-                uB = uB.to(hidden_normed.device, dtype=hidden_normed.dtype)
                 up_out = up_out + (hidden_normed @ uA.T) @ uB.T * self.scaling
 
             up_out = layer.mlp.act_fn(up_out)
@@ -588,8 +652,6 @@ class DINOv3LoRAEncoder(nn.Module):
             if "down_proj" in lora_weights:
                 dA = lora_weights["down_proj"]["lora_A"][i]
                 dB = lora_weights["down_proj"]["lora_B"][i]
-                dA = dA.to(up_out.device, dtype=up_out.dtype)
-                dB = dB.to(up_out.device, dtype=up_out.dtype)
                 mlp_out = mlp_out + (up_out @ dA.T) @ dB.T * self.scaling
 
             hidden = layer.drop_path(layer.layer_scale2(mlp_out)) + residual

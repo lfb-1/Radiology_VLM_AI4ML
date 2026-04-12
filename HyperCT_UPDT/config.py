@@ -23,7 +23,7 @@ class VisionConfig:
     encoder_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     encoder_dim: int = 768
     num_slices: int = 33  # divisible by 3
-    slice_size: Tuple[int, int] = (512, 512)  # multiple of DINOv3 patch_size=16
+    slice_size: Tuple[int, int] = (224, 224)  # DINOv3 ViT-B native resolution (patch_size=16)
     cube_pool_levels: int = 2  # 2x2x2 cube merging levels
     lora_rank: int = 16
     lora_scaling: float = 1.0  # LoRA output scaling factor (reference default)
