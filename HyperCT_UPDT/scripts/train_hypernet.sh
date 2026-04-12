@@ -8,7 +8,7 @@
 #SBATCH --output=hyperct_train_hypernet_%j.out
 #SBATCH --error=hyperct_train_hypernet_%j.err
 
-set -euo pipefail
+
 
 module purge
 module load anaconda3

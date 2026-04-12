@@ -8,7 +8,7 @@
 #SBATCH --output=hyperct_precompute_%j.out
 #SBATCH --error=hyperct_precompute_%j.err
 
-set -euo pipefail
+
 
 module purge
 module load anaconda3
