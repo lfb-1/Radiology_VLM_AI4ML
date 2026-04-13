@@ -304,7 +304,9 @@ def main():
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--num_task_tokens", type=int, default=3,
                         help="Number of top tasks to select based on classifier confidence")
-    parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument("--bf16", dest="bf16", action="store_true")
+    parser.add_argument("--no-bf16", dest="bf16", action="store_false")
+    parser.set_defaults(bf16=True)
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--qformer_checkpoint", type=str, default=None)
     parser.add_argument("--attn_implementation", type=str, default="eager",

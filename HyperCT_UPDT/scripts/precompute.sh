@@ -1,41 +1,54 @@
 #!/bin/bash
 #SBATCH --job-name=hyperct_precompute
-#SBATCH -p sablab-gpu
-#SBATCH --gres=gpu:1
+#SBATCH --partition=cornell
+#SBATCH --account=cornell
+#SBATCH --qos=cornell
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=72:00:00
-#SBATCH --output=hyperct_precompute_%j.out
-#SBATCH --error=hyperct_precompute_%j.err
+#SBATCH --mem=96G
+#SBATCH --time=3-00:00:00
+#SBATCH --gpus-per-node=1
+#SBATCH --output=logs/hyperct_precompute_%j.out
+#SBATCH --error=logs/hyperct_precompute_%j.err
 
+set -euo pipefail
 
+PROJECT_DIR="${PROJECT_DIR:-/mnt/lustre/cornell/$USER/source/Radiology_VLM_AI4ML}"
+DATA_ROOT="${DATA_ROOT:-/mnt/lustre/cornell/$USER/data/ct_ratev2}"
+INPUT_DATA_DIR="${INPUT_DATA_DIR:-$DATA_ROOT/train_fixed}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/HyperCT_UPDT/precomputed_tokens}"
+CHECKPOINT="${CHECKPOINT:-$PROJECT_DIR/HyperCT_UPDT/checkpoints/hypernet/best_checkpoint.pth}"
 
-module purge
-module load anaconda3
-eval "$(conda shell.bash hook)"
-conda activate test
-
-# Install dependencies (confirmed working setup)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install einops open_clip_torch timm deepspeed ninja
-pip install flash-attn --no-build-isolation
-pip install "transformers>=4.56.0" nibabel tqdm
-pip install "numpy<2"
-pip install --upgrade peft
-pip install --upgrade pip wheel
-pip install --force-reinstall --no-deps markupsafe==3.0.3
-
-PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HRadiology_VLM_AI4ML/HyperCT_UPDT
+mkdir -p "$PROJECT_DIR/HyperCT_UPDT/logs" "$OUTPUT_DIR"
 cd "$PROJECT_DIR"
 
-python precompute_tokens.py \
-    --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train_fixed \
-    --output_dir ./precomputed_tokens \
-    --checkpoint ./checkpoints/hypernet/best_checkpoint.pth \
-    --num_slices 33 \
-    --slice_height 224 \
-    --slice_width 224 \
-    --cube_pool_levels 2 \
-    --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
-    --lora_rank 16 \
-    --lora_scaling 1.0
+if command -v module >/dev/null 2>&1; then
+    module purge || true
+    if [[ -n "${HYPERCT_MODULES:-cuda12.4/toolkit/12.4.1}" ]]; then
+        for module_name in ${HYPERCT_MODULES:-cuda12.4/toolkit/12.4.1}; do
+            module load "$module_name"
+        done
+    fi
+fi
+
+if [[ -n "${HYPERCT_ENV_ACTIVATE:-}" ]]; then
+    eval "$HYPERCT_ENV_ACTIVATE"
+elif command -v conda >/dev/null 2>&1; then
+    CONDA_BASE="$(conda info --base)"
+    # shellcheck source=/dev/null
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+    conda activate "${HYPERCT_CONDA_ENV:-hyperct_updt}"
+fi
+
+python -u HyperCT_UPDT/precompute_tokens.py \
+    --data_dir "$INPUT_DATA_DIR" \
+    --output_dir "$OUTPUT_DIR" \
+    --checkpoint "$CHECKPOINT" \
+    --num_slices "${NUM_SLICES:-33}" \
+    --slice_height "${SLICE_HEIGHT:-224}" \
+    --slice_width "${SLICE_WIDTH:-224}" \
+    --cube_pool_levels "${CUBE_POOL_LEVELS:-2}" \
+    --encoder_name "${ENCODER_NAME:-facebook/dinov3-vitb16-pretrain-lvd1689m}" \
+    --lora_rank "${LORA_RANK:-16}" \
+    --lora_scaling "${LORA_SCALING:-1.0}"
