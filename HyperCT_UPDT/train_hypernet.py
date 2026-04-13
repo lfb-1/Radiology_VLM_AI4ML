@@ -419,6 +419,8 @@ def main():
                         help="JSON with multi-label annotations")
     parser.add_argument("--val_labels_json", type=str, default=None,
                         help="Optional validation labels JSON")
+    parser.add_argument("--val_data_dir", type=str, default=None,
+                        help="Directory with validation .nii.gz files (defaults to --data_dir)")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/hypernet")
     parser.add_argument("--encoder_name", type=str,
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
@@ -489,8 +491,9 @@ def main():
 
     val_loader = None
     if args.val_labels_json:
+        val_data_dir = args.val_data_dir or args.data_dir
         val_ds = CTMultiLabelDataset(
-            args.data_dir, args.val_labels_json, slice_size, args.num_slices,
+            val_data_dir, args.val_labels_json, slice_size, args.num_slices,
         )
         val_loader = DataLoader(
             val_ds, batch_size=args.batch_size, shuffle=False,

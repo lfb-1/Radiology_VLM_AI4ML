@@ -32,6 +32,7 @@ python train_hypernet.py \
     --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train_fixed \
     --labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
     --val_labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
+    --val_data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/valid_fixed \
     --output_dir ./checkpoints/hypernet \
     --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
     --lora_rank 16 \
