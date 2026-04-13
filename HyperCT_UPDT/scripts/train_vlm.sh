@@ -16,8 +16,9 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/mnt/lustre/cornell/$USER/source/Radiology_VLM_AI4ML}"
 DATA_ROOT="${DATA_ROOT:-/mnt/lustre/cornell/$USER/data/ct_ratev2}"
+DATASET_DIR="${DATASET_DIR:-$DATA_ROOT/data_volumes/dataset}"
 TOKENS_DIR="${TOKENS_DIR:-$PROJECT_DIR/HyperCT_UPDT/precomputed_tokens}"
-TRAIN_JSON="${TRAIN_JSON:-$DATA_ROOT/vqa/train_vqa.json}"
+TRAIN_JSON="${TRAIN_JSON:-$DATASET_DIR/vqa/train_vqa.json}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/HyperCT_UPDT/checkpoints/hyperct_vlm}"
 QFORMER_CHECKPOINT="${QFORMER_CHECKPOINT:-}"
 DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-}"

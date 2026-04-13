@@ -16,10 +16,11 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/mnt/lustre/cornell/$USER/source/Radiology_VLM_AI4ML}"
 DATA_ROOT="${DATA_ROOT:-/mnt/lustre/cornell/$USER/data/ct_ratev2}"
-TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-$DATA_ROOT/train_fixed}"
-VAL_DATA_DIR="${VAL_DATA_DIR:-$DATA_ROOT/valid_fixed}"
-TRAIN_JSON="${TRAIN_JSON:-$DATA_ROOT/vqa/train_vqa.json}"
-VAL_JSON="${VAL_JSON:-$DATA_ROOT/vqa/valid_vqa.json}"
+DATASET_DIR="${DATASET_DIR:-$DATA_ROOT/data_volumes/dataset}"
+TRAIN_DATA_DIR="${TRAIN_DATA_DIR:-$DATASET_DIR/train_fixed}"
+VAL_DATA_DIR="${VAL_DATA_DIR:-$DATASET_DIR/valid_fixed}"
+TRAIN_JSON="${TRAIN_JSON:-$DATASET_DIR/vqa/train_vqa.json}"
+VAL_JSON="${VAL_JSON:-$DATASET_DIR/vqa/valid_vqa.json}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/HyperCT_UPDT/checkpoints/hypernet}"
 CHECKPOINT="${CHECKPOINT:-}"
 

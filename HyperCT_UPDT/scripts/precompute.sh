@@ -16,7 +16,8 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/mnt/lustre/cornell/$USER/source/Radiology_VLM_AI4ML}"
 DATA_ROOT="${DATA_ROOT:-/mnt/lustre/cornell/$USER/data/ct_ratev2}"
-INPUT_DATA_DIR="${INPUT_DATA_DIR:-$DATA_ROOT/train_fixed}"
+DATASET_DIR="${DATASET_DIR:-$DATA_ROOT/data_volumes/dataset}"
+INPUT_DATA_DIR="${INPUT_DATA_DIR:-$DATASET_DIR/train_fixed}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/HyperCT_UPDT/precomputed_tokens}"
 CHECKPOINT="${CHECKPOINT:-$PROJECT_DIR/HyperCT_UPDT/checkpoints/hypernet/best_checkpoint.pth}"
 
