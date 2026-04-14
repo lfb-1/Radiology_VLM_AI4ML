@@ -32,6 +32,10 @@ Usage:
         --output_dir ./checkpoints/hypernet
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from models.pooling import ensure_length, pad_volume_slices, CubePooler
 from models.encoder import DINOv3LoRAEncoder
 from config import RADIOLOGICAL_TASKS
@@ -40,7 +44,6 @@ import json
 import random
 import argparse
 import logging
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -48,9 +51,6 @@ import torch.nn.functional as F
 import numpy as np
 import nibabel as nib
 from torch.utils.data import Dataset, DataLoader
-
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 logging.basicConfig(level=logging.INFO,

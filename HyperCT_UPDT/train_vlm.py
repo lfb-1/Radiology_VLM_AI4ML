@@ -15,13 +15,16 @@ Usage:
         --llm_name meta-llama/Llama-3.1-8B-Instruct
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from models.qformer import QFormerAdapter
 from config import RADIOLOGICAL_TASKS
 import os
 import json
 import argparse
 import logging
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -36,9 +39,6 @@ from transformers import (
     Trainer,
 )
 from peft import LoraConfig, get_peft_model
-
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 logging.basicConfig(level=logging.INFO,

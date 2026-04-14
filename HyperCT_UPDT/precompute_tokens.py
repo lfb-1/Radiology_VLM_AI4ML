@@ -24,22 +24,22 @@ Usage:
         --cube_pool_levels 2
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from models.pooling import CubePooler, ensure_length, pad_volume_slices
 from models.encoder import DINOv3LoRAEncoder
 from config import RADIOLOGICAL_TASKS
 import os
 import argparse
 import logging
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 import nibabel as nib
 from tqdm import tqdm
-
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 logging.basicConfig(level=logging.INFO,
