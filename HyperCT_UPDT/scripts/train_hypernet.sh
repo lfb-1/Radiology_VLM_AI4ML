@@ -44,7 +44,8 @@ python train_hypernet.py \
     --cube_pool_levels 2 \
     --lr 1e-5 \
     --weight_decay 1e-2 \
-    --epochs 20 \
+    --epochs 5 \
+    --early_stop_patience 3 \
     --num_workers 4 \
     --max_batches_per_epoch 5000 \
     --seed 42

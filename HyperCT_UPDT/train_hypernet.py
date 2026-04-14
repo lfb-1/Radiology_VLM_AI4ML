@@ -51,6 +51,7 @@ import torch.nn.functional as F
 import numpy as np
 import nibabel as nib
 from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_auc_score
 
 
 logging.basicConfig(level=logging.INFO,
@@ -354,6 +355,8 @@ def train_one_epoch(
     num_batches = 0
     num_valid = 0
     num_skipped = 0
+    all_preds = []
+    all_targets = []
 
     for batch_idx, batch in enumerate(dataloader):
         if max_batches and batch_idx >= max_batches:
@@ -431,14 +434,30 @@ def train_one_epoch(
         num_batches += 1
         num_valid += K
 
+        # Collect for AUC
+        all_preds.append(pred_logits.detach().cpu())
+        all_targets.append(batch_task_labels.detach().cpu())
+
         if batch_idx % 10 == 0:
             log.info(f"Epoch {epoch} | Batch {batch_idx}/{len(dataloader)} | "
                      f"Loss {loss.item():.4f} | Valid {K}")
 
     avg_loss = total_loss / max(num_batches, 1)
+
+    # Compute AUC
+    train_auc = None
+    if all_preds:
+        all_p = torch.cat(all_preds).sigmoid().numpy()
+        all_t = torch.cat(all_targets).numpy()
+        if len(np.unique(all_t)) > 1:
+            train_auc = roc_auc_score(all_t, all_p)
+            log.info(f"Epoch {epoch} train AUC: {train_auc:.4f}")
+        else:
+            log.info(f"Epoch {epoch} train AUC: N/A (single class in targets)")
+
     log.info(f"Epoch {epoch} complete — avg loss: {avg_loss:.4f}, "
              f"valid samples: {num_valid}, skipped batches: {num_skipped}")
-    return avg_loss
+    return avg_loss, train_auc
 
 
 @torch.no_grad()
@@ -454,6 +473,8 @@ def evaluate(
     pooler.eval()
     total_loss = 0.0
     num_batches = 0
+    all_preds = []
+    all_targets = []
 
     for batch in dataloader:
         all_slices = batch["slices"].to(device)
@@ -496,9 +517,24 @@ def evaluate(
         total_loss += loss.item()
         num_batches += 1
 
+        all_preds.append(pred_logits.cpu())
+        all_targets.append(batch_task_labels.cpu())
+
     avg_loss = total_loss / max(num_batches, 1)
+
+    # Compute AUC
+    val_auc = None
+    if all_preds:
+        all_p = torch.cat(all_preds).sigmoid().numpy()
+        all_t = torch.cat(all_targets).numpy()
+        if len(np.unique(all_t)) > 1:
+            val_auc = roc_auc_score(all_t, all_p)
+            log.info(f"Validation AUC: {val_auc:.4f}")
+        else:
+            log.info("Validation AUC: N/A (single class in targets)")
+
     log.info(f"Validation loss: {avg_loss:.4f}")
-    return avg_loss
+    return avg_loss, val_auc
 
 
 def save_checkpoint(encoder, epoch, output_dir, is_best=False, pooler=None):
@@ -552,7 +588,9 @@ def main():
                         help="CubePooler 2x2x2 merging levels (must match precompute)")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--early_stop_patience", type=int, default=3,
+                        help="Stop if val loss doesn't improve for N epochs")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_batches_per_epoch", type=int, default=None,
@@ -656,21 +694,22 @@ def main():
 
     # Training loop
     best_val_loss = float("inf")
+    epochs_without_improvement = 0
     log.info("Starting HyperNetwork training...")
 
     for epoch in range(1, args.epochs + 1):
         log.info(f"=== Epoch {epoch}/{args.epochs} ===")
 
-        train_loss = train_one_epoch(
+        train_loss, train_auc = train_one_epoch(
             encoder, optimizer, criterion, train_loader, device, epoch, scaler,
             pooler=pooler,
             max_batches=args.max_batches_per_epoch,
         )
 
-        val_loss = None
+        val_loss, val_auc = None, None
         if val_loader is not None:
-            val_loss = evaluate(encoder, criterion, val_loader, device,
-                                pooler=pooler)
+            val_loss, val_auc = evaluate(encoder, criterion, val_loader, device,
+                                         pooler=pooler)
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -680,10 +719,20 @@ def main():
         is_best = val_loss is not None and val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             log.info(f"New best validation loss: {best_val_loss:.4f}")
+        elif val_loss is not None:
+            epochs_without_improvement += 1
+            log.info(f"No improvement for {epochs_without_improvement} epoch(s)")
 
         save_checkpoint(encoder, epoch, args.output_dir, is_best=is_best,
                         pooler=pooler)
+
+        # Early stopping
+        if val_loss is not None and epochs_without_improvement >= args.early_stop_patience:
+            log.info(f"Early stopping triggered after {epoch} epochs "
+                     f"(patience={args.early_stop_patience})")
+            break
 
     # Save final
     final_path = os.path.join(args.output_dir, "final_checkpoint.pth")
