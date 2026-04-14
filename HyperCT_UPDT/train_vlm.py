@@ -15,6 +15,8 @@ Usage:
         --llm_name meta-llama/Llama-3.1-8B-Instruct
 """
 
+from models.qformer import QFormerAdapter
+from config import RADIOLOGICAL_TASKS
 import os
 import json
 import argparse
@@ -38,10 +40,9 @@ from peft import LoraConfig, get_peft_model
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import RADIOLOGICAL_TASKS
-from models.qformer import QFormerAdapter
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 IMAGE_TOKEN = "<image>"
@@ -86,17 +87,23 @@ class VQADataset(Dataset):
 
         # Load precomputed tokens
         npz_path = os.path.join(self.tokens_dir, item["image"])
-        npz_data = np.load(npz_path, allow_pickle=True)
+        npz_data = np.load(npz_path)
         all_tokens = npz_data["tokens"]       # (num_tasks, T_out, 768)
         predictions = npz_data["predictions"]  # (num_tasks, num_tasks)
 
         # Select top-k tasks by classifier confidence (diagonal logits)
         # Diagonal[i] = how well task i's LoRA detects task i in this volume
         diag = np.diag(predictions)
-        k = min(self.num_task_tokens, len(diag))
-        top_indices = np.argsort(diag)[-k:]  # highest-confidence tasks
-        vision_tokens = torch.from_numpy(all_tokens[top_indices]).float()
-        vision_tokens = vision_tokens.reshape(-1, vision_tokens.shape[-1])
+
+        # Soft weighted combination: instead of hard top-k selection (which
+        # can propagate errors if the classifier picks wrong tasks), use
+        # softmax-weighted sum across ALL tasks. Low-confidence tasks
+        # contribute minimally; no hard thresholding risk.
+        weights = torch.softmax(torch.from_numpy(diag).float(), dim=0)
+        all_tokens_t = torch.from_numpy(
+            all_tokens).float()  # (num_tasks, T_out, 768)
+        # Weighted sum: (T_out, 768) — each task's tokens weighted by confidence
+        vision_tokens = torch.einsum('t, t n d -> n d', weights, all_tokens_t)
 
         # Build conversation
         convs = item["conversations"]
@@ -105,9 +112,11 @@ class VQADataset(Dataset):
             role = conv["from"]
             content = conv["value"]
             if role == "human":
-                text_parts.append(f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
+                text_parts.append(
+                    f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
             elif role == "gpt":
-                text_parts.append(f"<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>")
+                text_parts.append(
+                    f"<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>")
 
         full_text = "<|begin_of_text|>" + "".join(text_parts)
 
@@ -118,7 +127,8 @@ class VQADataset(Dataset):
 
         for i, chunk in enumerate(chunks):
             if chunk:
-                chunk_ids = self.tokenizer.encode(chunk, add_special_tokens=False)
+                chunk_ids = self.tokenizer.encode(
+                    chunk, add_special_tokens=False)
                 input_ids.extend(chunk_ids)
             if i < len(chunks) - 1:
                 image_token_positions.append(len(input_ids))
@@ -127,7 +137,8 @@ class VQADataset(Dataset):
         input_ids = torch.tensor(input_ids[:self.max_length], dtype=torch.long)
 
         # Filter positions that survived truncation
-        image_token_positions = [p for p in image_token_positions if p < len(input_ids)]
+        image_token_positions = [
+            p for p in image_token_positions if p < len(input_ids)]
 
         # Labels: mask everything before assistant responses
         labels = input_ids.clone()
@@ -177,7 +188,8 @@ def collate_fn(batch, pad_token_id: int):
         seq_len = b["input_ids"].shape[0]
         pad_len = max_len - seq_len
 
-        input_ids.append(F.pad(b["input_ids"], (0, pad_len), value=pad_token_id))
+        input_ids.append(
+            F.pad(b["input_ids"], (0, pad_len), value=pad_token_id))
         labels.append(F.pad(b["labels"], (0, pad_len), value=IGNORE_INDEX))
         mask = torch.ones(seq_len, dtype=torch.long)
         attention_mask.append(F.pad(mask, (0, pad_len), value=0))
@@ -219,53 +231,73 @@ class HyperCTVLM(nn.Module):
         device = input_ids.device
         B = input_ids.shape[0]
 
-        # Vision token injection changes sequence length per sample,
-        # so batch_size must be 1 (gradient accumulation handles effective batch).
-        assert B == 1, (
-            f"HyperCTVLM requires batch_size=1 per GPU (got {B}). "
-            "Use gradient_accumulation_steps for larger effective batch."
-        )
-
-        # Get text embeddings
+        # Get text embeddings (clamp IMAGE_TOKEN_INDEX to valid range)
         text_embeds = self.llm.get_input_embeddings()(
-            input_ids.clamp(min=0)  # clamp IMAGE_TOKEN_INDEX to valid range
-        )  # (1, seq_len, hidden_dim)
+            input_ids.clamp(min=0)
+        )  # (B, seq_len, hidden_dim)
 
-        if len(image_positions[0]) > 0:
-            # Process vision tokens through Q-Former
-            v_tokens = vision_tokens[0].unsqueeze(0).to(device)  # (1, N, 768)
-            aligned = self.qformer(v_tokens)  # (1, num_queries, 4096)
-            aligned = aligned.squeeze(0).to(text_embeds.dtype)  # (num_queries, 4096)
-            num_vision = aligned.shape[0]
+        new_embeds_list = []
+        new_labels_list = []
+        new_mask_list = []
 
-            # Replace IMAGE_TOKEN placeholder with vision features
-            pos = image_positions[0][0].item()
-            pre = text_embeds[0, :pos]           # before <image>
-            post = text_embeds[0, pos + 1:]      # after <image>
-            new_embeds = torch.cat([pre, aligned, post], dim=0).unsqueeze(0)
+        for i in range(B):
+            if len(image_positions[i]) > 0:
+                # Process vision tokens through Q-Former
+                v_tokens = vision_tokens[i].unsqueeze(
+                    0).to(device)  # (1, N, 768)
+                aligned = self.qformer(v_tokens)  # (1, num_queries, 4096)
+                aligned = aligned.squeeze(0).to(
+                    text_embeds.dtype)  # (num_queries, 4096)
+                num_vision = aligned.shape[0]
 
-            # Adjust labels: mask vision token positions
-            pre_labels = labels[0, :pos]
-            post_labels = labels[0, pos + 1:]
-            vision_labels = torch.full(
-                (num_vision,), IGNORE_INDEX, device=device, dtype=labels.dtype
-            )
-            new_labels = torch.cat([pre_labels, vision_labels, post_labels]).unsqueeze(0)
+                # Replace IMAGE_TOKEN placeholder with vision features
+                pos = image_positions[i][0].item()
+                pre_emb = text_embeds[i, :pos]
+                post_emb = text_embeds[i, pos + 1:]
+                sample_embeds = torch.cat([pre_emb, aligned, post_emb], dim=0)
 
-            # Adjust attention mask
-            pre_mask = attention_mask[0, :pos]
-            post_mask = attention_mask[0, pos + 1:]
-            vision_mask = torch.ones(num_vision, device=device, dtype=attention_mask.dtype)
-            new_mask = torch.cat([pre_mask, vision_mask, post_mask]).unsqueeze(0)
-        else:
-            new_embeds = text_embeds
-            new_labels = labels
-            new_mask = attention_mask
+                # Adjust labels and mask
+                pre_lab = labels[i, :pos]
+                post_lab = labels[i, pos + 1:]
+                vis_lab = torch.full(
+                    (num_vision,), IGNORE_INDEX, device=device, dtype=labels.dtype)
+                sample_labels = torch.cat([pre_lab, vis_lab, post_lab])
+
+                pre_mask = attention_mask[i, :pos]
+                post_mask = attention_mask[i, pos + 1:]
+                vis_mask = torch.ones(
+                    num_vision, device=device, dtype=attention_mask.dtype)
+                sample_mask = torch.cat([pre_mask, vis_mask, post_mask])
+            else:
+                sample_embeds = text_embeds[i]
+                sample_labels = labels[i]
+                sample_mask = attention_mask[i]
+
+            new_embeds_list.append(sample_embeds)
+            new_labels_list.append(sample_labels)
+            new_mask_list.append(sample_mask)
+
+        # Pad all samples to the same max length after vision injection
+        max_len = max(e.shape[0] for e in new_embeds_list)
+        hidden_dim = text_embeds.shape[-1]
+
+        padded_embeds = torch.zeros(
+            B, max_len, hidden_dim, device=device, dtype=text_embeds.dtype)
+        padded_labels = torch.full(
+            (B, max_len), IGNORE_INDEX, device=device, dtype=labels.dtype)
+        padded_mask = torch.zeros(
+            B, max_len, device=device, dtype=attention_mask.dtype)
+
+        for i in range(B):
+            cur_len = new_embeds_list[i].shape[0]
+            padded_embeds[i, :cur_len] = new_embeds_list[i]
+            padded_labels[i, :cur_len] = new_labels_list[i]
+            padded_mask[i, :cur_len] = new_mask_list[i]
 
         outputs = self.llm(
-            inputs_embeds=new_embeds,
-            labels=new_labels,
-            attention_mask=new_mask,
+            inputs_embeds=padded_embeds,
+            labels=padded_labels,
+            attention_mask=padded_mask,
         )
         return outputs
 
@@ -288,7 +320,8 @@ def main():
     parser.add_argument("--tokens_dir", type=str, required=True)
     parser.add_argument("--data_json", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./checkpoints/vlm")
-    parser.add_argument("--llm_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--llm_name", type=str,
+                        default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--llm_hidden_size", type=int, default=4096)
     parser.add_argument("--vision_dim", type=int, default=768)
     parser.add_argument("--num_queries", type=int, default=64)
@@ -307,7 +340,7 @@ def main():
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--qformer_checkpoint", type=str, default=None)
-    parser.add_argument("--attn_implementation", type=str, default="eager",
+    parser.add_argument("--attn_implementation", type=str, default="flash_attention_2",
                         choices=["eager", "flash_attention_2", "sdpa"])
     args = parser.parse_args()
 
@@ -348,13 +381,14 @@ def main():
     )
 
     if args.qformer_checkpoint:
-        state = torch.load(args.qformer_checkpoint, map_location="cpu", weights_only=True)
+        state = torch.load(args.qformer_checkpoint,
+                           map_location="cpu", weights_only=True)
         qformer.load_state_dict(state)
         log.info(f"Loaded Q-Former checkpoint: {args.qformer_checkpoint}")
 
     # Dataset
     dataset = VQADataset(args.data_json, args.tokens_dir, tokenizer, args.max_length,
-                          num_task_tokens=args.num_task_tokens)
+                         num_task_tokens=args.num_task_tokens)
     log.info(f"Dataset: {len(dataset)} samples")
 
     # Training args

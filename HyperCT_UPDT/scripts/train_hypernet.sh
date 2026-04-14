@@ -40,7 +40,8 @@ python train_hypernet.py \
     --num_slices 33 \
     --slice_height 224 \
     --slice_width 224 \
-    --batch_size 8 \
+    --batch_size 2 \
+    --cube_pool_levels 2 \
     --lr 1e-5 \
     --weight_decay 1e-2 \
     --epochs 20 \

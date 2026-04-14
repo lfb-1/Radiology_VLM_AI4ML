@@ -42,9 +42,9 @@ torchrun --nproc_per_node=4 train_vlm.py \
     --lora_dropout 0.05 \
     --lr 2e-5 \
     --epochs 3 \
-    --batch_size 1 \
-    --grad_accum 8 \
+    --batch_size 4 \
+    --grad_accum 2 \
     --max_length 2048 \
     --num_task_tokens 3 \
     --bf16 \
-    --attn_implementation eager
+    --attn_implementation flash_attention_2

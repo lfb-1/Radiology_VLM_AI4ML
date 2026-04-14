@@ -84,6 +84,42 @@ class MLPResidualBlock(nn.Module):
         return x + self.mlp(x)
 
 
+class ImageConditioner(nn.Module):
+    """
+    Lightweight image content encoder for conditioning the HyperNetwork.
+
+    Instead of generating identical LoRA weights for ALL "nodule" scans,
+    this extracts a coarse content vector from raw pixels so the HyperNet
+    can adapt LoRA weights to the specific scan (e.g., large vs tiny nodule).
+
+    Uses adaptive pooling + MLP on raw pixel values — no DINOv3 pass needed.
+    Cost: negligible (~0.1ms per image).
+    """
+
+    def __init__(self, cond_dim: int = 64):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d((8, 8))  # 8x8 spatial grid
+        self.proj = nn.Sequential(
+            nn.Linear(3 * 64, cond_dim * 2),
+            nn.SiLU(),
+            nn.Linear(cond_dim * 2, cond_dim),
+            nn.LayerNorm(cond_dim),
+        )
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pixel_values: (B, 3, H, W) raw RGB pixel values
+        Returns:
+            cond: (1, cond_dim) mean-pooled across batch
+        """
+        pooled = self.pool(pixel_values)  # (B, 3, 8, 8)
+        flat = pooled.flatten(1)          # (B, 192)
+        cond = self.proj(flat)            # (B, cond_dim)
+        # (1, cond_dim) — shared across batch
+        return cond.mean(dim=0, keepdim=True)
+
+
 class LoRAHypernet(nn.Module):
     """
     HyperNetwork following HyperCT reference architecture.
@@ -109,11 +145,13 @@ class LoRAHypernet(nn.Module):
         head_in_size: int = 768,
         in_features: Optional[Dict[str, int]] = None,
         out_features: Optional[Dict[str, int]] = None,
+        image_cond_dim: int = 64,
     ):
         super().__init__()
         self.target_modules = target_modules
         self.num_layers = num_layers
         self.lora_rank = lora_rank
+        self.image_cond_dim = image_cond_dim
 
         if in_features is None:
             self.in_features = {m: 768 for m in target_modules}
@@ -144,8 +182,14 @@ class LoRAHypernet(nn.Module):
 
         self.module_to_int = {m: i for i, m in enumerate(target_modules)}
 
-        # MLP input = task_emb + depth_emb + type_emb
-        mlp_inp_size = encoded_task_emb_size + depth_emb_size + type_emb_size
+        # MLP input = task_emb + depth_emb + type_emb + image_cond
+        mlp_inp_size = encoded_task_emb_size + \
+            depth_emb_size + type_emb_size + image_cond_dim
+
+        # Image conditioner — lightweight content-aware feature extraction
+        self.image_conditioner = ImageConditioner(cond_dim=image_cond_dim)
+        # Stored conditioning (set via set_image_conditioning before generate_full_model_lora)
+        self._image_cond = None
 
         # Main processing network (from HyperCT reference)
         self.mixer = nn.Sequential(
@@ -158,8 +202,10 @@ class LoRAHypernet(nn.Module):
             nn.Dropout(0.05),
         )
 
-        self.mlp1 = MLPResidualBlock(mlp_inp_size, mlp_inp_size * 4, mlp_inp_size)
-        self.mlp2 = MLPResidualBlock(mlp_inp_size, mlp_inp_size * 4, mlp_inp_size)
+        self.mlp1 = MLPResidualBlock(
+            mlp_inp_size, mlp_inp_size * 4, mlp_inp_size)
+        self.mlp2 = MLPResidualBlock(
+            mlp_inp_size, mlp_inp_size * 4, mlp_inp_size)
 
         self.mlp3 = nn.Sequential(
             nn.LayerNorm(mlp_inp_size),
@@ -176,8 +222,10 @@ class LoRAHypernet(nn.Module):
         for module in target_modules:
             in_feat = self.in_features[module]
             out_feat = self.out_features[module]
-            self.split_shapes[module] = [lora_rank * in_feat, lora_rank * out_feat]
-            output_size = self.split_shapes[module][0] + self.split_shapes[module][1]
+            self.split_shapes[module] = [
+                lora_rank * in_feat, lora_rank * out_feat]
+            output_size = self.split_shapes[module][0] + \
+                self.split_shapes[module][1]
 
             layer = nn.Linear(head_in_size, output_size, bias=True)
             # LoRA_A: small random init; LoRA_B: zero init → delta_W starts at 0
@@ -198,8 +246,24 @@ class LoRAHypernet(nn.Module):
     def _embed_layer_type(self, layer_type: str) -> torch.Tensor:
         module_idx = self.module_to_int[layer_type]
         device = next(self.parameters()).device
-        module_idx = torch.tensor([module_idx], dtype=torch.long, device=device)
+        module_idx = torch.tensor(
+            [module_idx], dtype=torch.long, device=device)
         return self.layer_type_encoder(module_idx)
+
+    def set_image_conditioning(self, pixel_values: torch.Tensor):
+        """
+        Pre-compute image conditioning vector for the current batch.
+        Call this BEFORE generate_full_model_lora().
+
+        Args:
+            pixel_values: (B, 3, H, W) raw RGB pixel values
+        """
+        self._image_cond = self.image_conditioner(
+            pixel_values)  # (1, cond_dim)
+
+    def clear_image_conditioning(self):
+        """Reset image conditioning (for inference without it)."""
+        self._image_cond = None
 
     def _hypernet_forward(self, layer_indices: torch.Tensor, layer_type: str,
                           encoded_task_emb: torch.Tensor):
@@ -207,7 +271,17 @@ class LoRAHypernet(nn.Module):
         depth_emb = self._embed_layer_depth(layer_indices)
         layer_type_emb = self._embed_layer_type(layer_type).expand(bs, -1)
 
-        cat_emb = torch.cat([encoded_task_emb, depth_emb, layer_type_emb], dim=-1)
+        # Concatenate task + depth + type + image conditioning
+        if self._image_cond is not None:
+            img_cond = self._image_cond.expand(bs, -1)
+        else:
+            # Fallback: zero conditioning (backward compatible)
+            device = encoded_task_emb.device
+            img_cond = torch.zeros(bs, self.image_cond_dim, device=device,
+                                   dtype=encoded_task_emb.dtype)
+
+        cat_emb = torch.cat([encoded_task_emb, depth_emb, layer_type_emb,
+                             img_cond], dim=-1)
 
         mlp_inp = self.mixer(cat_emb)
         mlp_out = self.mlp1(mlp_inp)
@@ -260,7 +334,8 @@ class LoRAHypernet(nn.Module):
                                  "lora_B": (num_layers, out_feat, rank)}]
         """
         device = next(self.parameters()).device
-        layer_indices = torch.arange(self.num_layers, device=device, dtype=torch.long)
+        layer_indices = torch.arange(
+            self.num_layers, device=device, dtype=torch.long)
 
         full_lora_weights = {}
         for module_name in self.target_modules:
@@ -339,7 +414,8 @@ class DINOv3LoRAEncoder(nn.Module):
         self.scaling = lora_scaling  # Reference uses scaling_factor=1.0 directly
 
         # Read register tokens from model config
-        self.num_register_tokens = getattr(self.encoder.config, 'num_register_tokens', 4)
+        self.num_register_tokens = getattr(
+            self.encoder.config, 'num_register_tokens', 4)
 
         # Discover transformer layer list regardless of HuggingFace model wrapper attribute name.
         # DINOv2 wraps as .encoder.layer, DINOv3ViTModel may use .model.layer, .vit.layer, etc.
@@ -373,9 +449,12 @@ class DINOv3LoRAEncoder(nn.Module):
 
         # MLP modules: up_proj, down_proj (HyperCT reference: mlp_up, mlp_down)
         sample_mlp = self._transformer_layers[0].mlp
-        assert hasattr(sample_mlp, 'up_proj'), f"DINOv3 MLP missing up_proj: {type(sample_mlp)}"
-        assert hasattr(sample_mlp, 'down_proj'), f"DINOv3 MLP missing down_proj: {type(sample_mlp)}"
-        assert hasattr(sample_mlp, 'act_fn'), f"DINOv3 MLP missing act_fn: {type(sample_mlp)}"
+        assert hasattr(
+            sample_mlp, 'up_proj'), f"DINOv3 MLP missing up_proj: {type(sample_mlp)}"
+        assert hasattr(
+            sample_mlp, 'down_proj'), f"DINOv3 MLP missing down_proj: {type(sample_mlp)}"
+        assert hasattr(
+            sample_mlp, 'act_fn'), f"DINOv3 MLP missing act_fn: {type(sample_mlp)}"
         assert not hasattr(sample_mlp, 'gate_proj'), (
             f"DINOv3 MLP has gate_proj (SwiGLU). The manual MLP decomposition "
             f"(up_proj → act_fn → down_proj) does not handle gating. "
@@ -516,7 +595,7 @@ class DINOv3LoRAEncoder(nn.Module):
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
         """Rotate half of the hidden dims — standard RoPE helper."""
         x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
+        x2 = x[..., x.shape[-1] // 2:]
         return torch.cat((-x2, x1), dim=-1)
 
     def _apply_rotary_pos_emb(

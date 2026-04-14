@@ -24,6 +24,9 @@ Usage:
         --cube_pool_levels 2
 """
 
+from models.pooling import CubePooler, ensure_length, pad_volume_slices
+from models.encoder import DINOv3LoRAEncoder
+from config import RADIOLOGICAL_TASKS
 import os
 import argparse
 import logging
@@ -38,11 +41,9 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import RADIOLOGICAL_TASKS
-from models.encoder import DINOv3LoRAEncoder
-from models.pooling import CubePooler, ensure_length, pad_volume_slices
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 
@@ -71,10 +72,12 @@ def load_nifti_slices(path: str, num_slices: int, slice_size: tuple,
         volume = np.moveaxis(volume, depth_axis, 0)
 
     D, H, W = volume.shape
-    volume_t = torch.from_numpy(volume).unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
+    volume_t = torch.from_numpy(volume).unsqueeze(
+        0).unsqueeze(0)  # (1, 1, D, H, W)
 
     # Resample depth
-    volume_t = F.interpolate(volume_t, size=(num_slices, H, W), mode="trilinear", align_corners=False)
+    volume_t = F.interpolate(volume_t, size=(
+        num_slices, H, W), mode="trilinear", align_corners=False)
 
     # Resample spatial
     volume_t = F.interpolate(
@@ -141,12 +144,15 @@ def precompute_single_volume(
         # Generate LoRA weights ONCE per task (same across all slices)
         lora_weights = encoder.hypernet.generate_full_model_lora(task_id)
 
-        slice_tokens = []
-        for g in range(num_rgb_images):
-            rgb = slices_to_rgb(slices, g)  # (3, H, W)
-            pixel_values = rgb.unsqueeze(0).to(device)  # (1, 3, H, W)
-            tokens = encoder.forward_with_lora(pixel_values, lora_weights)  # (1, N_patches, 768)
-            slice_tokens.append(tokens)
+        # Batch all RGB groups into a single forward pass (11x fewer DINOv3
+        # forward passes per task). LoRA weights are shared across the batch.
+        all_rgb = torch.stack(
+            [slices_to_rgb(slices, g) for g in range(num_rgb_images)]
+        ).to(device)  # (num_rgb, 3, H, W)
+        all_tokens = encoder.forward_with_lora(
+            all_rgb, lora_weights)  # (num_rgb, N_patches, 768)
+        slice_tokens = [all_tokens[g:g+1]
+                        for g in range(num_rgb_images)]  # list of (1, N, D)
 
         # 2×2×2 cube pooling
         pooled = pooler(slice_tokens)  # (1, final_tokens, D)
@@ -157,8 +163,10 @@ def precompute_single_volume(
         all_task_tokens.append(pooled.cpu())
         all_predictions.append(pred.cpu())
 
-    stacked_tokens = torch.cat(all_task_tokens, dim=0)  # (num_tasks, N_tokens, D)
-    stacked_preds = torch.cat(all_predictions, dim=0)   # (num_tasks, num_tasks)
+    # (num_tasks, N_tokens, D)
+    stacked_tokens = torch.cat(all_task_tokens, dim=0)
+    # (num_tasks, num_tasks)
+    stacked_preds = torch.cat(all_predictions, dim=0)
 
     return {
         "tokens": stacked_tokens.numpy(),
@@ -168,15 +176,20 @@ def precompute_single_volume(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Precompute HyperCT vision tokens")
-    parser.add_argument("--data_dir", type=str, required=True, help="Dir with .nii.gz files")
-    parser.add_argument("--output_dir", type=str, default="./precomputed_tokens")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Encoder+HyperNet checkpoint")
+    parser = argparse.ArgumentParser(
+        description="Precompute HyperCT vision tokens")
+    parser.add_argument("--data_dir", type=str, required=True,
+                        help="Dir with .nii.gz files")
+    parser.add_argument("--output_dir", type=str,
+                        default="./precomputed_tokens")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Encoder+HyperNet checkpoint")
     parser.add_argument("--num_slices", type=int, default=33)
-    parser.add_argument("--slice_height", type=int, default=512)
-    parser.add_argument("--slice_width", type=int, default=512)
+    parser.add_argument("--slice_height", type=int, default=224)
+    parser.add_argument("--slice_width", type=int, default=224)
     parser.add_argument("--cube_pool_levels", type=int, default=2)
-    parser.add_argument("--encoder_name", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m")
+    parser.add_argument("--encoder_name", type=str,
+                        default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_scaling", type=float, default=1.0)
     args = parser.parse_args()
@@ -198,7 +211,8 @@ def main():
 
     checkpoint_state = None
     if args.checkpoint:
-        checkpoint_state = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        checkpoint_state = torch.load(
+            args.checkpoint, map_location=device, weights_only=True)
         encoder.load_state_dict(checkpoint_state["encoder"], strict=False)
         log.info(f"Loaded checkpoint: {args.checkpoint}")
 
