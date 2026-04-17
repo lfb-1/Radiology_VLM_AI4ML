@@ -50,6 +50,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import nibabel as nib
+from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import roc_auc_score
 
@@ -88,9 +89,29 @@ class CTMultiLabelDataset(Dataset):
             key = r["image"]
             if key not in seen:
                 seen[key] = r
-        self.records = list(seen.values())
-        log.info(f"Deduplicated to {len(self.records)} unique volumes "
+        deduped = list(seen.values())
+        log.info(f"Deduplicated to {len(deduped)} unique volumes "
                  f"(was {len(raw_records)} records)")
+
+        # Filter out records with no valid (0/1) labels — these would be
+        # skipped during training anyway, wasting I/O and compute.
+        self.records = []
+        num_no_labels = 0
+        for r in deduped:
+            labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
+            if "labels" in r:
+                for i, task in enumerate(RADIOLOGICAL_TASKS):
+                    if task in r["labels"]:
+                        labels[i] = float(r["labels"][task])
+            elif "conversations" in r:
+                labels = self._labels_from_conversations(r["conversations"])
+            if (labels != -1).any():
+                self.records.append(r)
+            else:
+                num_no_labels += 1
+        if num_no_labels > 0:
+            log.info(f"Filtered out {num_no_labels} volumes with no valid labels "
+                     f"(all abstain) — {len(self.records)} usable volumes remain")
 
         self.data_dir = data_dir
         self.preprocess_dir = preprocess_dir
@@ -355,8 +376,10 @@ def train_one_epoch(
     num_batches = 0
     num_valid = 0
     num_skipped = 0
-    all_preds = []
-    all_targets = []
+    # Per-task prediction tracking — mixing tasks into a single AUC is
+    # methodologically wrong; compute per-task AUC then macro-average.
+    task_preds: dict = defaultdict(list)
+    task_targets: dict = defaultdict(list)
 
     for batch_idx, batch in enumerate(dataloader):
         if max_batches and batch_idx >= max_batches:
@@ -434,9 +457,9 @@ def train_one_epoch(
         num_batches += 1
         num_valid += K
 
-        # Collect for AUC
-        all_preds.append(pred_logits.detach().cpu())
-        all_targets.append(batch_task_labels.detach().cpu())
+        # Collect per-task for AUC
+        task_preds[chosen_task].append(pred_logits.detach().cpu())
+        task_targets[chosen_task].append(batch_task_labels.detach().cpu())
 
         if batch_idx % 10 == 0:
             log.info(f"Epoch {epoch} | Batch {batch_idx}/{len(dataloader)} | "
@@ -444,16 +467,22 @@ def train_one_epoch(
 
     avg_loss = total_loss / max(num_batches, 1)
 
-    # Compute AUC
-    train_auc = None
-    if all_preds:
-        all_p = torch.cat(all_preds).sigmoid().numpy()
-        all_t = torch.cat(all_targets).numpy()
-        if len(np.unique(all_t)) > 1:
-            train_auc = roc_auc_score(all_t, all_p)
-            log.info(f"Epoch {epoch} train AUC: {train_auc:.4f}")
-        else:
-            log.info(f"Epoch {epoch} train AUC: N/A (single class in targets)")
+    # Compute per-task AUC then macro-average (correct for paper reporting)
+    per_task_auc = {}
+    for task_idx in sorted(task_preds.keys()):
+        p = torch.cat(task_preds[task_idx]).sigmoid().numpy()
+        t = torch.cat(task_targets[task_idx]).numpy()
+        if len(np.unique(t)) > 1:
+            task_auc = roc_auc_score(t, p)
+            per_task_auc[task_idx] = task_auc
+            log.info(f"  Epoch {epoch} | {RADIOLOGICAL_TASKS[task_idx]}: "
+                     f"AUC={task_auc:.4f} (n={len(t)})")
+    train_auc = float(np.mean(list(per_task_auc.values()))) if per_task_auc else None
+    if train_auc is not None:
+        log.info(f"Epoch {epoch} train macro-AUC: {train_auc:.4f} "
+                 f"({len(per_task_auc)}/{len(RADIOLOGICAL_TASKS)} tasks)")
+    else:
+        log.info(f"Epoch {epoch} train AUC: N/A")
 
     log.info(f"Epoch {epoch} complete — avg loss: {avg_loss:.4f}, "
              f"valid samples: {num_valid}, skipped batches: {num_skipped}")
@@ -473,8 +502,8 @@ def evaluate(
     pooler.eval()
     total_loss = 0.0
     num_batches = 0
-    all_preds = []
-    all_targets = []
+    task_preds: dict = defaultdict(list)
+    task_targets: dict = defaultdict(list)
 
     for batch in dataloader:
         all_slices = batch["slices"].to(device)
@@ -517,21 +546,27 @@ def evaluate(
         total_loss += loss.item()
         num_batches += 1
 
-        all_preds.append(pred_logits.cpu())
-        all_targets.append(batch_task_labels.cpu())
+        task_preds[chosen_task].append(pred_logits.cpu())
+        task_targets[chosen_task].append(batch_task_labels.cpu())
 
     avg_loss = total_loss / max(num_batches, 1)
 
-    # Compute AUC
-    val_auc = None
-    if all_preds:
-        all_p = torch.cat(all_preds).sigmoid().numpy()
-        all_t = torch.cat(all_targets).numpy()
-        if len(np.unique(all_t)) > 1:
-            val_auc = roc_auc_score(all_t, all_p)
-            log.info(f"Validation AUC: {val_auc:.4f}")
-        else:
-            log.info("Validation AUC: N/A (single class in targets)")
+    # Compute per-task AUC then macro-average
+    per_task_auc = {}
+    for task_idx in sorted(task_preds.keys()):
+        p = torch.cat(task_preds[task_idx]).sigmoid().numpy()
+        t = torch.cat(task_targets[task_idx]).numpy()
+        if len(np.unique(t)) > 1:
+            task_auc = roc_auc_score(t, p)
+            per_task_auc[task_idx] = task_auc
+            log.info(f"  Val | {RADIOLOGICAL_TASKS[task_idx]}: "
+                     f"AUC={task_auc:.4f} (n={len(t)})")
+    val_auc = float(np.mean(list(per_task_auc.values()))) if per_task_auc else None
+    if val_auc is not None:
+        log.info(f"Validation macro-AUC: {val_auc:.4f} "
+                 f"({len(per_task_auc)}/{len(RADIOLOGICAL_TASKS)} tasks)")
+    else:
+        log.info("Validation AUC: N/A")
 
     log.info(f"Validation loss: {avg_loss:.4f}")
     return avg_loss, val_auc
@@ -686,13 +721,29 @@ def main():
         weight_decay=args.weight_decay,
         betas=(0.9, 0.95),
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs,
+    # Warmup for the first ~20% of epochs, then cosine decay to 1% of peak LR.
+    # Without warmup the model jumps into a poor local minimum in epoch 1 and
+    # val loss diverges on subsequent epochs.
+    warmup_epochs = max(1, args.epochs // 5)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs,
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, args.epochs - warmup_epochs),
+        eta_min=args.lr * 0.01,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
     )
     criterion = nn.BCEWithLogitsLoss()
     scaler = torch.amp.GradScaler(enabled=device.type == "cuda")
 
     # Training loop
+    # Track best by val_auc (primary paper metric) with val_loss as tiebreaker.
+    best_val_auc = -1.0
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     log.info("Starting HyperNetwork training...")
@@ -715,13 +766,24 @@ def main():
         current_lr = scheduler.get_last_lr()[0]
         log.info(f"LR: {current_lr:.2e}")
 
-        # Checkpointing
-        is_best = val_loss is not None and val_loss < best_val_loss
+        # Checkpointing — best model by val_auc (primary paper metric).
+        # Fall back to val_loss improvement if val_auc is unavailable.
+        if val_auc is not None:
+            is_best = val_auc > best_val_auc or (
+                val_auc == best_val_auc and val_loss is not None and val_loss < best_val_loss
+            )
+        else:
+            is_best = val_loss is not None and val_loss < best_val_loss
+
         if is_best:
-            best_val_loss = val_loss
+            if val_auc is not None:
+                best_val_auc = val_auc
+            if val_loss is not None:
+                best_val_loss = val_loss
             epochs_without_improvement = 0
-            log.info(f"New best validation loss: {best_val_loss:.4f}")
-        elif val_loss is not None:
+            log.info(f"New best — val macro-AUC: {best_val_auc:.4f}, "
+                     f"val loss: {best_val_loss:.4f}")
+        elif val_loss is not None or val_auc is not None:
             epochs_without_improvement += 1
             log.info(f"No improvement for {epochs_without_improvement} epoch(s)")
 
