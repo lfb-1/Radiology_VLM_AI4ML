@@ -29,7 +29,7 @@ Usage:
     python train_hypernet.py \\
         --data_dir /path/to/nifti_files \\
         --labels_json /path/to/labels.json \\
-        --output_dir ./checkpoints_1/hypernet
+        --output_dir ./checkpoint_2
 """
 
 from sklearn.metrics import roc_auc_score
@@ -694,7 +694,7 @@ def main():
     parser.add_argument("--val_data_dir", type=str, default=None,
                         help="Directory with validation .nii.gz files (defaults to --data_dir)")
     parser.add_argument("--output_dir", type=str,
-                        default="./checkpoints_1/hypernet")
+                        default="./checkpoint_2")
     parser.add_argument("--encoder_name", type=str,
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=16)
