@@ -431,6 +431,14 @@ def train_one_epoch(
             log.info(
                 f"  reached max_batches={max_batches}, stopping epoch early")
             break
+
+        if batch_idx % 50 == 0:
+            log.info(f"  batch {batch_idx} / {len(dataloader)}")
+
+        all_slices = batch["slices"].to(device)     # (B, num_slices, H, W)
+        labels = batch["labels"].to(device)         # (B, num_tasks)
+        vmask = batch["valid_mask"].to(device)      # (B, num_tasks)
+
         if batch_idx == 0:
             log.info("First batch loaded — training started.")
             # Diagnostic: log label stats for first batch to catch data issues early
@@ -440,12 +448,6 @@ def train_one_epoch(
             log.info(f"  First batch diagnostics: valid_per_sample={valid_per_sample.tolist()}, "
                      f"total_valid_labels={vmask.sum().item()}, "
                      f"tasks_with_valid={int((valid_per_task > 0).sum().item())}/18")
-        if batch_idx % 50 == 0:
-            log.info(f"  batch {batch_idx} / {len(dataloader)}")
-
-        all_slices = batch["slices"].to(device)    # (B, num_slices, H, W)
-        labels = batch["labels"].to(device)         # (B, num_tasks)
-        vmask = batch["valid_mask"].to(device)      # (B, num_tasks)
 
         # Single task per batch for efficiency
         chosen_task, batch_task_labels, sample_ok = sample_task_for_batch(
