@@ -29,7 +29,7 @@ Usage:
     python train_hypernet.py \\
         --data_dir /path/to/nifti_files \\
         --labels_json /path/to/labels.json \\
-        --output_dir ./checkpoints/hypernet
+        --output_dir ./checkpoints_1/hypernet
 """
 
 from sklearn.metrics import roc_auc_score
@@ -694,7 +694,7 @@ def main():
     parser.add_argument("--val_data_dir", type=str, default=None,
                         help="Directory with validation .nii.gz files (defaults to --data_dir)")
     parser.add_argument("--output_dir", type=str,
-                        default="./checkpoints/hypernet")
+                        default="./checkpoints_1/hypernet")
     parser.add_argument("--encoder_name", type=str,
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=16)
@@ -928,12 +928,13 @@ def main():
 
     # Save final
     final_path = os.path.join(args.output_dir, "final_checkpoint.pth")
-    torch.save({
+    final_state = {
         "encoder": encoder.state_dict(),
         "hypernet": encoder.hypernet.state_dict(),
         "classifier": encoder.classifier.state_dict(),
         "pooler": pooler.state_dict(),
-    }, final_path)
+    }
+    torch.save(final_state, final_path)
     log.info(f"Saved final checkpoint: {final_path}")
     log.info("HyperNetwork training complete.")
 
