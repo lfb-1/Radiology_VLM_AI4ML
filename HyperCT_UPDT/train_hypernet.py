@@ -81,12 +81,26 @@ class CTMultiLabelDataset(Dataset):
         log.info(f"Loaded {len(raw_records)} records with images "
                  f"(skipped {len(all_records) - len(raw_records)} without)")
 
-        # Deduplicate: multiple VQA records per volume → keep first per image
+        # Merge multiple VQA records per volume instead of keeping only the
+        # first one. CT-RATE VQA commonly stores separate QA records per scan,
+        # so "first record wins" throws away most task supervision.
         seen = {}
         for r in raw_records:
             key = r["image"]
             if key not in seen:
-                seen[key] = r
+                seen[key] = {
+                    **r,
+                    "labels": dict(r.get("labels", {}))
+                    if isinstance(r.get("labels"), dict) else {},
+                    "conversations": list(r.get("conversations", []))
+                    if isinstance(r.get("conversations"), list) else [],
+                }
+            else:
+                merged = seen[key]
+                if isinstance(r.get("labels"), dict):
+                    merged["labels"].update(r["labels"])
+                if isinstance(r.get("conversations"), list):
+                    merged["conversations"].extend(r["conversations"])
         deduped = list(seen.values())
         log.info(f"Deduplicated to {len(deduped)} unique volumes "
                  f"(was {len(raw_records)} records)")
@@ -96,14 +110,7 @@ class CTMultiLabelDataset(Dataset):
         self.records = []
         num_no_labels = 0
         for r in deduped:
-            labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
-            if "labels" in r and isinstance(r["labels"], dict) and r["labels"]:
-                for i, task in enumerate(RADIOLOGICAL_TASKS):
-                    if task in r["labels"]:
-                        labels[i] = float(r["labels"][task])
-            # Fall through to conversations if labels dict was empty or missing
-            if (labels == -1).all() and "conversations" in r:
-                labels = self._labels_from_conversations(r["conversations"])
+            labels = self._labels_from_record(r)
             if (labels != -1).any():
                 self.records.append(r)
             else:
@@ -228,6 +235,23 @@ class CTMultiLabelDataset(Dataset):
         return labels
 
     @staticmethod
+    def _labels_from_record(rec: dict) -> torch.Tensor:
+        """Build a multi-task label vector from merged record content."""
+        labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
+        if "labels" in rec and isinstance(rec["labels"], dict) and rec["labels"]:
+            for i, task in enumerate(RADIOLOGICAL_TASKS):
+                if task in rec["labels"]:
+                    labels[i] = float(rec["labels"][task])
+        # Fall through only for tasks still missing after explicit labels.
+        if (labels == -1).any() and "conversations" in rec:
+            conv_labels = CTMultiLabelDataset._labels_from_conversations(
+                rec["conversations"]
+            )
+            missing = labels == -1
+            labels[missing] = conv_labels[missing]
+        return labels
+
+    @staticmethod
     def _augment_slices(slices: torch.Tensor) -> torch.Tensor:
         """
         Light CT-appropriate augmentations on (num_slices, H, W) tensor.
@@ -284,14 +308,7 @@ class CTMultiLabelDataset(Dataset):
 
         # Build multi-label vector — prefer explicit labels, fall back to
         # keyword extraction from GPT conversation responses.
-        labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
-        if "labels" in rec and isinstance(rec["labels"], dict) and rec["labels"]:
-            for i, task in enumerate(RADIOLOGICAL_TASKS):
-                if task in rec["labels"]:
-                    labels[i] = float(rec["labels"][task])
-        # Fall through to conversations if labels dict was empty or missing
-        if (labels == -1).all() and "conversations" in rec:
-            labels = self._labels_from_conversations(rec["conversations"])
+        labels = self._labels_from_record(rec)
 
         valid_mask = labels != -1
 
@@ -830,13 +847,7 @@ def main():
     # This will help balance rare and common tasks, boosting macro-AUC.
     label_counts = torch.zeros(len(RADIOLOGICAL_TASKS), 2)  # [task, 0/1]
     for rec in train_ds.records:
-        labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
-        if "labels" in rec and isinstance(rec["labels"], dict) and rec["labels"]:
-            for i, task in enumerate(RADIOLOGICAL_TASKS):
-                if task in rec["labels"]:
-                    labels[i] = float(rec["labels"][task])
-        if (labels == -1).all() and "conversations" in rec:
-            labels = train_ds._labels_from_conversations(rec["conversations"])
+        labels = train_ds._labels_from_record(rec)
         for i, v in enumerate(labels):
             if v == 0:
                 label_counts[i, 0] += 1
