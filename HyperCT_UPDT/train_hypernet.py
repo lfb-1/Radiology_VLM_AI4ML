@@ -32,27 +32,25 @@ Usage:
         --output_dir ./checkpoints/hypernet
 """
 
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict
+import nibabel as nib
+import numpy as np
+import torch.nn.functional as F
+import torch.nn as nn
+import torch
+import logging
+import argparse
+import random
+import json
+import os
+from config import RADIOLOGICAL_TASKS
+from models.encoder import DINOv3LoRAEncoder
+from models.pooling import ensure_length, pad_volume_slices, CubePooler
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from models.pooling import ensure_length, pad_volume_slices, CubePooler
-from models.encoder import DINOv3LoRAEncoder
-from config import RADIOLOGICAL_TASKS
-import os
-import json
-import random
-import argparse
-import logging
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import nibabel as nib
-from collections import defaultdict
-from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import roc_auc_score
 
 
 logging.basicConfig(level=logging.INFO,
@@ -76,7 +74,7 @@ class CTMultiLabelDataset(Dataset):
     def __init__(self, data_dir: str, labels_json: str,
                  slice_size: tuple = (224, 224), num_slices: int = 33,
                  hu_min: float = -1000, hu_max: float = 1000,
-                 preprocess_dir: str = None):
+                 preprocess_dir: str = None, augment: bool = False):
         with open(labels_json, "r") as f:
             all_records = json.load(f)
         raw_records = [r for r in all_records if "image" in r]
@@ -99,11 +97,12 @@ class CTMultiLabelDataset(Dataset):
         num_no_labels = 0
         for r in deduped:
             labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
-            if "labels" in r:
+            if "labels" in r and isinstance(r["labels"], dict) and r["labels"]:
                 for i, task in enumerate(RADIOLOGICAL_TASKS):
                     if task in r["labels"]:
                         labels[i] = float(r["labels"][task])
-            elif "conversations" in r:
+            # Fall through to conversations if labels dict was empty or missing
+            if (labels == -1).all() and "conversations" in r:
                 labels = self._labels_from_conversations(r["conversations"])
             if (labels != -1).any():
                 self.records.append(r)
@@ -120,6 +119,7 @@ class CTMultiLabelDataset(Dataset):
         self.hu_min = hu_min
         self.hu_max = hu_max
         self.num_rgb = self.num_slices // 3
+        self.augment = augment
 
     def __len__(self):
         return len(self.records)
@@ -178,46 +178,84 @@ class CTMultiLabelDataset(Dataset):
           0  if the response explicitly says it is absent / not observed
          -1  (abstain) if not mentioned at all
         """
-        # Collect all GPT response text
+        # Collect all GPT/assistant response text
+        # Support both "gpt" (legacy) and "assistant" (OpenAI/Llama chat format)
         gpt_text = " ".join(
             turn["value"].lower()
             for turn in conversations
-            if turn.get("from") == "gpt"
+            if turn.get("from") in ("gpt", "assistant")
         )
 
         # Keyword map: task_name → (positive keywords, negative phrases)
+        # IMPORTANT: negative phrases are checked FIRST. If a negative phrase
+        # matches, the task is labelled 0 regardless of positive keywords.
+        # Positive keywords use word-boundary-safe strings (no trailing space
+        # hacks) to avoid false positives like "mass" missing end-of-sentence.
         TASK_KEYWORDS = {
-            "opacity":               (["opaci", "opacity", "opacification"], ["no opaci", "without opaci"]),
-            "nodule":                (["nodule", "nodular"], ["no nodule", "without nodule"]),
-            "consolidation":         (["consolidat"], ["no consolidat"]),
-            "atelectasis":           (["atelectas", "atelectatic"], ["no atelectas"]),
-            "pleural_effusion":      (["pleural effusion", "pleural fluid"], ["no pleural effusion", "pleural effusion was not"]),
-            "cardiomegaly":          (["cardiomegaly", "enlarged heart", "cardiac enlargement"], ["no cardiomegaly", "heart size is normal"]),
-            "emphysema":             (["emphysema", "emphysematous"], ["no emphysema"]),
-            "fibrosis":              (["fibros", "fibrotic"], ["no fibros"]),
-            "bronchiectasis":        (["bronchiectasis", "bronchiectatic"], ["no bronchiectasis"]),
-            "lymphadenopathy":       (["lymphadenopathy", "lymph node enlargement", "mediastinal lymph"], ["no lymphadenopathy"]),
-            "mass":                  (["mass ", "masses", "mass lesion"], ["no mass"]),
-            "pneumothorax":          (["pneumothorax"], ["no pneumothorax", "pneumothorax was not"]),
+            "opacity":               (["opaci", "opacification"], ["no opaci", "without opaci"]),
+            "nodule":                (["nodule", "nodular"], ["no nodule", "without nodule", "no evidence of nodule"]),
+            "consolidation":         (["consolidat"], ["no consolidat", "without consolidat"]),
+            "atelectasis":           (["atelectas", "atelectatic"], ["no atelectas", "without atelectas"]),
+            "pleural_effusion":      (["pleural effusion", "pleural fluid"], ["no pleural effusion", "pleural effusion was not", "no pleural fluid"]),
+            "cardiomegaly":          (["cardiomegaly", "enlarged heart", "cardiac enlargement"], ["no cardiomegaly", "heart size is normal", "normal cardiac size"]),
+            "emphysema":             (["emphysema", "emphysematous"], ["no emphysema", "without emphysema"]),
+            "fibrosis":              (["fibros", "fibrotic"], ["no fibros", "without fibros"]),
+            "bronchiectasis":        (["bronchiectasis", "bronchiectatic"], ["no bronchiectasis", "without bronchiectasis"]),
+            "lymphadenopathy":       (["lymphadenopathy", "lymph node enlargement", "mediastinal lymph"], ["no lymphadenopathy", "no enlarged lymph"]),
+            # "mass" uses multi-word phrases only to avoid matching "no mass" substring
+            "mass":                  (["mass lesion", "soft tissue mass", "pulmonary mass", "lung mass", " masses"], ["no mass", "no evidence of mass"]),
+            "pneumothorax":          (["pneumothorax"], ["no pneumothorax", "pneumothorax was not", "without pneumothorax"]),
             "pericardial_effusion":  (["pericardial effusion"], ["no pericardial effusion", "pericardial effusion was not", "pericardial effusion-thickening was not"]),
-            "calcification":         (["calcif", "calcific"], ["no calcif"]),
-            "medical_material":      (["catheter", "pacemaker", "stent", "prosthes", "implant", "device", "tube"], []),
-            "mosaic_attenuation":    (["mosaic attenuation", "mosaic pattern"], ["no mosaic"]),
-            "peribronchial_thickening": (["peribronchial thickening", "bronchial wall thickening"], ["no peribronchial"]),
-            "hiatal_hernia":         (["hiatal hernia", "hiatus hernia"], ["no hiatal hernia"]),
+            "calcification":         (["calcif", "calcific"], ["no calcif", "without calcif"]),
+            "medical_material":      (["catheter", "pacemaker", "stent", "prosthes", "implant", "medical device", "chest tube"], []),
+            "mosaic_attenuation":    (["mosaic attenuation", "mosaic pattern"], ["no mosaic", "without mosaic"]),
+            "peribronchial_thickening": (["peribronchial thickening", "bronchial wall thickening"], ["no peribronchial", "without peribronchial"]),
+            "hiatal_hernia":         (["hiatal hernia", "hiatus hernia"], ["no hiatal hernia", "without hiatal hernia"]),
         }
 
         labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
         for i, task in enumerate(RADIOLOGICAL_TASKS):
             pos_kws, neg_phrases = TASK_KEYWORDS.get(task, ([], []))
+            # Negation check must come first — a sentence like "no mass lesion"
+            # contains both "no mass" (neg) and "mass lesion" (pos). Checking
+            # neg first ensures the negative label wins.
             neg_hit = any(neg in gpt_text for neg in neg_phrases)
-            pos_hit = any(kw in gpt_text for kw in pos_kws)
             if neg_hit:
                 labels[i] = 0.0
-            elif pos_hit:
+            elif any(kw in gpt_text for kw in pos_kws):
                 labels[i] = 1.0
             # else remains -1 (abstain)
         return labels
+
+    @staticmethod
+    def _augment_slices(slices: torch.Tensor) -> torch.Tensor:
+        """
+        Light CT-appropriate augmentations on (num_slices, H, W) tensor.
+        Values are in [0, 1] after HU windowing. Applied only during training.
+
+        - Horizontal flip: anatomically valid for CT (left-right symmetric findings)
+        - Intensity jitter: simulates scanner variability (±5% scale, ±3% shift)
+        - Gaussian noise: simulates low-dose CT noise (std=0.02)
+
+        No rotation/elastic deformation here — those require resampling the
+        already-loaded volume and would break slice ordering for CubePooler.
+        """
+        # Horizontal flip (p=0.5)
+        if random.random() < 0.5:
+            slices = torch.flip(slices, dims=[-1])
+
+        # Intensity jitter (p=0.5) — scale then shift, then clamp to [0,1]
+        if random.random() < 0.5:
+            scale = random.uniform(0.95, 1.05)
+            shift = random.uniform(-0.03, 0.03)
+            slices = (slices * scale + shift).clamp(0.0, 1.0)
+
+        # Gaussian noise (p=0.3)
+        if random.random() < 0.3:
+            noise = torch.randn_like(slices) * 0.02
+            slices = (slices + noise).clamp(0.0, 1.0)
+
+        return slices
 
     def __getitem__(self, idx):
         rec = self.records[idx]
@@ -237,6 +275,9 @@ class CTMultiLabelDataset(Dataset):
                 log.info(f"[dataset] loading idx={idx}: {nifti_path}")
             slices = self._load_volume(nifti_path)  # (num_slices, H, W)
 
+        if self.augment:
+            slices = self._augment_slices(slices)
+
         # Return full volume slices so training loop can process multiple
         # RGB groups through DINOv3+LoRA + CubePooler, matching the
         # precompute pipeline (fixes Stage 1↔2 distribution mismatch).
@@ -244,11 +285,12 @@ class CTMultiLabelDataset(Dataset):
         # Build multi-label vector — prefer explicit labels, fall back to
         # keyword extraction from GPT conversation responses.
         labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
-        if "labels" in rec:
+        if "labels" in rec and isinstance(rec["labels"], dict) and rec["labels"]:
             for i, task in enumerate(RADIOLOGICAL_TASKS):
                 if task in rec["labels"]:
                     labels[i] = float(rec["labels"][task])
-        elif "conversations" in rec:
+        # Fall through to conversations if labels dict was empty or missing
+        if (labels == -1).all() and "conversations" in rec:
             labels = self._labels_from_conversations(rec["conversations"])
 
         valid_mask = labels != -1
@@ -304,25 +346,27 @@ def sample_task_per_sample(labels: torch.Tensor, valid_mask: torch.Tensor):
 
 def sample_task_for_batch(labels: torch.Tensor, valid_mask: torch.Tensor):
     """
-    Pick ONE task for the entire batch — the task valid for the most samples.
+    Pick ONE task for the entire batch using inverse-frequency weighted sampling.
 
-    This yields exactly 1 LoRA generation + 1 batched forward pass per step,
-    instead of up to num_tasks separate passes (2-8x faster per step).
-    All tasks are still covered across batches over the epoch.
+    Tasks with fewer valid samples are sampled MORE often, ensuring rare tasks
+    (e.g. pneumothorax n=20, cardiomegaly n=28) get gradient signal instead of
+    being crowded out by common tasks. This is the primary fix for AUC ~0.5 on
+    rare tasks.
 
     Returns:
         chosen_task: int or None (if no valid task)
         batch_task_labels: (K,) float tensor of binary labels for valid samples
         sample_ok: (B,) bool mask of samples valid for the chosen task
     """
-    valid_counts = valid_mask.sum(dim=0)  # (num_tasks,)
+    valid_counts = valid_mask.sum(dim=0).float()  # (num_tasks,)
     if valid_counts.max() == 0:
         return None, None, None
 
-    # Pick randomly among tasks with the most valid samples
-    max_count = valid_counts.max().item()
-    candidates = (valid_counts == max_count).nonzero(as_tuple=True)[0]
-    chosen = candidates[random.randint(0, len(candidates) - 1)].item()
+    # Inverse-frequency weights: rare tasks get higher probability.
+    # Zero out tasks with no valid samples so they are never chosen.
+    weights = 1.0 / (valid_counts + 1e-6)
+    weights = weights * (valid_counts > 0).float()
+    chosen = torch.multinomial(weights, 1).item()
 
     sample_ok = valid_mask[:, chosen]
     batch_task_labels = labels[sample_ok, chosen]
@@ -353,6 +397,7 @@ def train_one_epoch(
     scaler: torch.amp.GradScaler,
     pooler: CubePooler,
     max_batches: int = None,
+    pos_weight: torch.Tensor = None,
 ):
     """
     Train one epoch with multi-slice 3D-aware training.
@@ -388,6 +433,13 @@ def train_one_epoch(
             break
         if batch_idx == 0:
             log.info("First batch loaded — training started.")
+            # Diagnostic: log label stats for first batch to catch data issues early
+            valid_per_sample = vmask.sum(dim=1)  # (B,) valid labels per sample
+            # (num_tasks,) valid samples per task
+            valid_per_task = vmask.sum(dim=0)
+            log.info(f"  First batch diagnostics: valid_per_sample={valid_per_sample.tolist()}, "
+                     f"total_valid_labels={vmask.sum().item()}, "
+                     f"tasks_with_valid={int((valid_per_task > 0).sum().item())}/18")
         if batch_idx % 50 == 0:
             log.info(f"  batch {batch_idx} / {len(dataloader)}")
 
@@ -400,6 +452,10 @@ def train_one_epoch(
             labels, vmask)
         if chosen_task is None or not sample_ok.any():
             num_skipped += 1
+            if num_skipped <= 3:
+                log.warning(f"  Skipping batch {batch_idx}: chosen_task={chosen_task}, "
+                            f"vmask_sum={vmask.sum().item()}, labels_range="
+                            f"[{labels.min().item():.1f}, {labels.max().item():.1f}]")
             continue
 
         all_slices = all_slices[sample_ok]  # (K, num_slices, H, W)
@@ -440,7 +496,14 @@ def train_one_epoch(
             pooled_batch = torch.cat(pooled_list, dim=0)
             logits = encoder.classify(pooled_batch)  # (K, num_tasks)
             pred_logits = logits[:, chosen_task]      # (K,)
-            loss = criterion(pred_logits, batch_task_labels)
+            # Use per-task pos_weight (scalar) instead of full pos_weight vector
+            # to avoid shape mismatch: pred_logits is (K,) not (num_tasks,)
+            if pos_weight is not None:
+                pw = pos_weight[chosen_task].expand_as(batch_task_labels)
+                loss = F.binary_cross_entropy_with_logits(
+                    pred_logits, batch_task_labels, pos_weight=pw)
+            else:
+                loss = criterion(pred_logits, batch_task_labels)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -477,7 +540,8 @@ def train_one_epoch(
             per_task_auc[task_idx] = task_auc
             log.info(f"  Epoch {epoch} | {RADIOLOGICAL_TASKS[task_idx]}: "
                      f"AUC={task_auc:.4f} (n={len(t)})")
-    train_auc = float(np.mean(list(per_task_auc.values()))) if per_task_auc else None
+    train_auc = float(np.mean(list(per_task_auc.values()))
+                      ) if per_task_auc else None
     if train_auc is not None:
         log.info(f"Epoch {epoch} train macro-AUC: {train_auc:.4f} "
                  f"({len(per_task_auc)}/{len(RADIOLOGICAL_TASKS)} tasks)")
@@ -496,8 +560,16 @@ def evaluate(
     dataloader: DataLoader,
     device: torch.device,
     pooler: CubePooler = None,
+    pos_weight: torch.Tensor = None,
 ):
-    """Evaluate on validation set with same multi-slice pipeline as training."""
+    """
+    Evaluate on validation set with same multi-slice pipeline as training.
+
+    Unlike training, evaluation iterates over ALL tasks that have valid labels
+    in each batch — not just the most-common one. This ensures rare tasks
+    (pneumothorax, cardiomegaly) appear in the AUC computation instead of
+    being silently skipped, giving an accurate macro-AUC.
+    """
     encoder.eval()
     pooler.eval()
     total_loss = 0.0
@@ -510,44 +582,57 @@ def evaluate(
         labels = batch["labels"].to(device)
         vmask = batch["valid_mask"].to(device)
 
-        chosen_task, batch_task_labels, sample_ok = sample_task_for_batch(
-            labels, vmask)
-        if chosen_task is None or not sample_ok.any():
+        # Evaluate every task that has at least one valid sample in this batch.
+        # This is affordable at eval time (no backward pass).
+        valid_counts = vmask.sum(dim=0)  # (num_tasks,)
+        tasks_in_batch = (valid_counts > 0).nonzero(as_tuple=True)[0].tolist()
+        if not tasks_in_batch:
             continue
 
-        all_slices = all_slices[sample_ok]
-        batch_task_labels = batch_task_labels.to(device)
-        K = all_slices.shape[0]
+        for chosen_task in tasks_in_batch:
+            sample_ok = vmask[:, chosen_task]
+            if not sample_ok.any():
+                continue
 
-        task_id = torch.tensor([chosen_task], device=device)
+            slices_k = all_slices[sample_ok]
+            batch_task_labels = labels[sample_ok, chosen_task]
+            K = slices_k.shape[0]
 
-        per_sample_rgb = [_build_rgb_groups(all_slices[i]) for i in range(K)]
-        num_rgb = per_sample_rgb[0].shape[0]
-        all_rgb = torch.cat(per_sample_rgb, dim=0)
+            task_id = torch.tensor([chosen_task], device=device)
 
-        encoder.hypernet.set_image_conditioning(all_rgb)
-        lora_w = encoder.hypernet.generate_full_model_lora(task_id)
-        encoder.hypernet.clear_image_conditioning()
+            per_sample_rgb = [_build_rgb_groups(slices_k[i]) for i in range(K)]
+            num_rgb = per_sample_rgb[0].shape[0]
+            all_rgb = torch.cat(per_sample_rgb, dim=0)
 
-        all_tokens = encoder.forward_with_lora(all_rgb, lora_w)
+            encoder.hypernet.set_image_conditioning(all_rgb)
+            lora_w = encoder.hypernet.generate_full_model_lora(task_id)
+            encoder.hypernet.clear_image_conditioning()
 
-        pooled_list = []
-        for i in range(K):
-            start = i * num_rgb
-            sample_tokens = all_tokens[start: start + num_rgb]
-            token_list = [sample_tokens[g:g+1] for g in range(num_rgb)]
-            pooled = pooler(token_list)
-            pooled_list.append(pooled)
+            all_tokens = encoder.forward_with_lora(all_rgb, lora_w)
 
-        pooled_batch = torch.cat(pooled_list, dim=0)
-        logits = encoder.classify(pooled_batch)
-        pred_logits = logits[:, chosen_task]
-        loss = criterion(pred_logits, batch_task_labels)
-        total_loss += loss.item()
-        num_batches += 1
+            pooled_list = []
+            for i in range(K):
+                start = i * num_rgb
+                sample_tokens = all_tokens[start: start + num_rgb]
+                token_list = [sample_tokens[g:g+1] for g in range(num_rgb)]
+                pooled = pooler(token_list)
+                pooled_list.append(pooled)
 
-        task_preds[chosen_task].append(pred_logits.cpu())
-        task_targets[chosen_task].append(batch_task_labels.cpu())
+            pooled_batch = torch.cat(pooled_list, dim=0)
+            logits = encoder.classify(pooled_batch)
+            pred_logits = logits[:, chosen_task]
+            # Use per-task pos_weight to avoid shape mismatch
+            if pos_weight is not None:
+                pw = pos_weight[chosen_task].expand_as(batch_task_labels)
+                loss = F.binary_cross_entropy_with_logits(
+                    pred_logits, batch_task_labels, pos_weight=pw)
+            else:
+                loss = criterion(pred_logits, batch_task_labels)
+            total_loss += loss.item()
+            num_batches += 1
+
+            task_preds[chosen_task].append(pred_logits.cpu())
+            task_targets[chosen_task].append(batch_task_labels.cpu())
 
     avg_loss = total_loss / max(num_batches, 1)
 
@@ -561,7 +646,8 @@ def evaluate(
             per_task_auc[task_idx] = task_auc
             log.info(f"  Val | {RADIOLOGICAL_TASKS[task_idx]}: "
                      f"AUC={task_auc:.4f} (n={len(t)})")
-    val_auc = float(np.mean(list(per_task_auc.values()))) if per_task_auc else None
+    val_auc = float(np.mean(list(per_task_auc.values()))
+                    ) if per_task_auc else None
     if val_auc is not None:
         log.info(f"Validation macro-AUC: {val_auc:.4f} "
                  f"({len(per_task_auc)}/{len(RADIOLOGICAL_TASKS)} tasks)")
@@ -676,7 +762,7 @@ def main():
     slice_size = (args.slice_height, args.slice_width)
     train_ds = CTMultiLabelDataset(
         args.data_dir, args.labels_json, slice_size, args.num_slices,
-        preprocess_dir=args.preprocess_dir,
+        preprocess_dir=args.preprocess_dir, augment=True,
     )
     use_persistent = args.num_workers > 0
     train_loader = DataLoader(
@@ -738,6 +824,48 @@ def main():
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[warmup_epochs],
     )
+    # --- Compute class frequencies for pos_weight ---
+    # This will help balance rare and common tasks, boosting macro-AUC.
+    label_counts = torch.zeros(len(RADIOLOGICAL_TASKS), 2)  # [task, 0/1]
+    for rec in train_ds.records:
+        labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
+        if "labels" in rec and isinstance(rec["labels"], dict) and rec["labels"]:
+            for i, task in enumerate(RADIOLOGICAL_TASKS):
+                if task in rec["labels"]:
+                    labels[i] = float(rec["labels"][task])
+        if (labels == -1).all() and "conversations" in rec:
+            labels = train_ds._labels_from_conversations(rec["conversations"])
+        for i, v in enumerate(labels):
+            if v == 0:
+                label_counts[i, 0] += 1
+            elif v == 1:
+                label_counts[i, 1] += 1
+
+    # Diagnostic: log total valid labels found
+    total_valid = label_counts.sum().item()
+    log.info(f"Label statistics: {int(total_valid)} total valid labels "
+             f"across {len(train_ds.records)} records")
+    if total_valid == 0:
+        log.warning("NO VALID LABELS FOUND — all tasks will be skipped! "
+                    "Check your JSON format: need 'labels' dict with keys from "
+                    "RADIOLOGICAL_TASKS or 'conversations' with from='gpt'/'assistant'.")
+    pos_weight = torch.ones(len(RADIOLOGICAL_TASKS))
+    for i in range(len(RADIOLOGICAL_TASKS)):
+        n_pos = label_counts[i, 1]
+        n_neg = label_counts[i, 0]
+        if n_pos > 0:
+            # Cap at 10 to prevent extreme weights on very rare classes
+            # (e.g. pneumothorax 20 pos / 5000 neg → raw weight 250 destabilises training).
+            # A cap of 10 still strongly upweights rare positives without causing
+            # gradient explosion or pushing logits to ±inf in early epochs.
+            pos_weight[i] = min(n_neg / n_pos, 10.0)
+        else:
+            pos_weight[i] = 1.0  # fallback if no positives
+    for i, task in enumerate(RADIOLOGICAL_TASKS):
+        log.info(f"  pos_weight[{task}] = {pos_weight[i]:.3f} "
+                 f"(neg={int(label_counts[i,0])}, pos={int(label_counts[i,1])})")
+    pos_weight = pos_weight.to(device)
+    # no pos_weight here; passed per-task in train/eval
     criterion = nn.BCEWithLogitsLoss()
     scaler = torch.amp.GradScaler(enabled=device.type == "cuda")
 
@@ -755,12 +883,13 @@ def main():
             encoder, optimizer, criterion, train_loader, device, epoch, scaler,
             pooler=pooler,
             max_batches=args.max_batches_per_epoch,
+            pos_weight=pos_weight,
         )
 
         val_loss, val_auc = None, None
         if val_loader is not None:
             val_loss, val_auc = evaluate(encoder, criterion, val_loader, device,
-                                         pooler=pooler)
+                                         pooler=pooler, pos_weight=pos_weight)
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -785,7 +914,8 @@ def main():
                      f"val loss: {best_val_loss:.4f}")
         elif val_loss is not None or val_auc is not None:
             epochs_without_improvement += 1
-            log.info(f"No improvement for {epochs_without_improvement} epoch(s)")
+            log.info(
+                f"No improvement for {epochs_without_improvement} epoch(s)")
 
         save_checkpoint(encoder, epoch, args.output_dir, is_best=is_best,
                         pooler=pooler)
