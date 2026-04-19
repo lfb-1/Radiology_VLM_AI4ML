@@ -29,7 +29,7 @@ Usage:
     python train_hypernet.py \\
         --data_dir /path/to/nifti_files \\
         --labels_json /path/to/labels.json \\
-        --output_dir ./checkpoint_2
+        --output_dir ./checkpoint_f1
 """
 
 from sklearn.metrics import roc_auc_score
@@ -420,11 +420,11 @@ def train_one_epoch(
     Train one epoch with multi-slice 3D-aware training.
 
     For each batch:
-        1. Pick one task for the batch
-        2. Generate LoRA weights via HyperNetwork
+        1. Iterate over all tasks with valid labels in the batch
+        2. Generate task-conditioned LoRA weights via HyperNetwork
         3. Process ALL RGB slice groups through DINOv3+LoRA (batched)
         4. CubePooler per sample → compressed 3D tokens
-        5. Classify on pooled tokens → BCE loss
+        5. Classify on pooled tokens → BCE loss for each valid task
 
     This aligns training with the precompute pipeline, fixing the
     Stage 1↔2 distribution mismatch.
@@ -466,64 +466,81 @@ def train_one_epoch(
                      f"total_valid_labels={vmask.sum().item()}, "
                      f"tasks_with_valid={int((valid_per_task > 0).sum().item())}/18")
 
-        # Single task per batch for efficiency
-        chosen_task, batch_task_labels, sample_ok = sample_task_for_batch(
-            labels, vmask)
-        if chosen_task is None or not sample_ok.any():
+        valid_counts = vmask.sum(dim=0)
+        tasks_in_batch = (valid_counts > 0).nonzero(as_tuple=True)[0].tolist()
+        if not tasks_in_batch:
             num_skipped += 1
             if num_skipped <= 3:
-                log.warning(f"  Skipping batch {batch_idx}: chosen_task={chosen_task}, "
+                log.warning(f"  Skipping batch {batch_idx}: no valid tasks, "
                             f"vmask_sum={vmask.sum().item()}, labels_range="
                             f"[{labels.min().item():.1f}, {labels.max().item():.1f}]")
             continue
 
-        all_slices = all_slices[sample_ok]  # (K, num_slices, H, W)
-        batch_task_labels = batch_task_labels.to(device)
-        K = all_slices.shape[0]
-
         optimizer.zero_grad()
+        batch_loss = None
+        batch_task_updates = 0
+        batch_valid = 0
+        batch_logged_tasks = []
 
         with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
-            task_id = torch.tensor([chosen_task], device=device)
+            for chosen_task in tasks_in_batch:
+                sample_ok = vmask[:, chosen_task]
+                if not sample_ok.any():
+                    continue
 
-            # Image conditioning: extract content features from raw pixels
-            # so LoRA weights adapt to this specific scan, not just the task.
-            per_sample_rgb = []
-            for i in range(K):
-                per_sample_rgb.append(_build_rgb_groups(all_slices[i]))
-            num_rgb = per_sample_rgb[0].shape[0]
-            all_rgb = torch.cat(per_sample_rgb, dim=0)  # (K*num_rgb, 3, H, W)
+                task_slices = all_slices[sample_ok]  # (K, num_slices, H, W)
+                batch_task_labels = labels[sample_ok, chosen_task]
+                K = task_slices.shape[0]
+                if K == 0:
+                    continue
 
-            encoder.hypernet.set_image_conditioning(all_rgb)
-            lora_w = encoder.hypernet.generate_full_model_lora(task_id)
-            encoder.hypernet.clear_image_conditioning()
+                task_id = torch.tensor([chosen_task], device=device)
 
-            all_tokens = encoder.forward_with_lora(all_rgb, lora_w)
-            # all_tokens: (K * num_rgb, N_patches, D)
+                # Image conditioning: extract content features from raw pixels
+                # so LoRA weights adapt to this specific scan, not just the task.
+                per_sample_rgb = []
+                for i in range(K):
+                    per_sample_rgb.append(_build_rgb_groups(task_slices[i]))
+                num_rgb = per_sample_rgb[0].shape[0]
+                all_rgb = torch.cat(per_sample_rgb, dim=0)  # (K*num_rgb, 3, H, W)
 
-            # Split back per sample and pool with CubePooler
-            pooled_list = []
-            for i in range(K):
-                start = i * num_rgb
-                sample_tokens = all_tokens[start: start + num_rgb]
-                # CubePooler expects list of (1, N, D)
-                token_list = [sample_tokens[g:g+1] for g in range(num_rgb)]
-                pooled = pooler(token_list)  # (1, final_tokens, D)
-                pooled_list.append(pooled)
+                encoder.hypernet.set_image_conditioning(all_rgb)
+                lora_w = encoder.hypernet.generate_full_model_lora(task_id)
+                encoder.hypernet.clear_image_conditioning()
 
-            # (K, final_tokens, D)
-            pooled_batch = torch.cat(pooled_list, dim=0)
-            logits = encoder.classify(pooled_batch)  # (K, num_tasks)
-            pred_logits = logits[:, chosen_task]      # (K,)
-            # Use per-task pos_weight (scalar) instead of full pos_weight vector
-            # to avoid shape mismatch: pred_logits is (K,) not (num_tasks,)
-            if pos_weight is not None:
-                pw = pos_weight[chosen_task].expand_as(batch_task_labels)
-                loss = F.binary_cross_entropy_with_logits(
-                    pred_logits, batch_task_labels, pos_weight=pw)
-            else:
-                loss = criterion(pred_logits, batch_task_labels)
+                all_tokens = encoder.forward_with_lora(all_rgb, lora_w)
+                # all_tokens: (K * num_rgb, N_patches, D)
 
+                # Split back per sample and pool with CubePooler
+                pooled_list = []
+                for i in range(K):
+                    start = i * num_rgb
+                    sample_tokens = all_tokens[start: start + num_rgb]
+                    # CubePooler expects list of (1, N, D)
+                    token_list = [sample_tokens[g:g+1] for g in range(num_rgb)]
+                    pooled = pooler(token_list)  # (1, final_tokens, D)
+                    pooled_list.append(pooled)
+
+                pooled_batch = torch.cat(pooled_list, dim=0)
+                logits = encoder.classify(pooled_batch)  # (K, num_tasks)
+                pred_logits = logits[:, chosen_task]     # (K,)
+                if pos_weight is not None:
+                    pw = pos_weight[chosen_task].expand_as(batch_task_labels)
+                    task_loss = F.binary_cross_entropy_with_logits(
+                        pred_logits, batch_task_labels, pos_weight=pw)
+                else:
+                    task_loss = criterion(pred_logits, batch_task_labels)
+
+                batch_loss = task_loss if batch_loss is None else batch_loss + task_loss
+                batch_task_updates += 1
+                batch_valid += K
+                batch_logged_tasks.append((chosen_task, pred_logits, batch_task_labels))
+
+        if batch_task_updates == 0 or batch_loss is None:
+            num_skipped += 1
+            continue
+
+        loss = batch_loss / batch_task_updates
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
@@ -537,15 +554,17 @@ def train_one_epoch(
 
         total_loss += loss.item()
         num_batches += 1
-        num_valid += K
+        num_valid += batch_valid
 
         # Collect per-task for AUC
-        task_preds[chosen_task].append(pred_logits.detach().cpu())
-        task_targets[chosen_task].append(batch_task_labels.detach().cpu())
+        for chosen_task, pred_logits, batch_task_labels in batch_logged_tasks:
+            task_preds[chosen_task].append(pred_logits.detach().cpu())
+            task_targets[chosen_task].append(batch_task_labels.detach().cpu())
 
         if batch_idx % 10 == 0:
             log.info(f"Epoch {epoch} | Batch {batch_idx}/{len(dataloader)} | "
-                     f"Loss {loss.item():.4f} | Valid {K}")
+                     f"Loss {loss.item():.4f} | Tasks {batch_task_updates} | "
+                     f"Valid {batch_valid}")
 
     avg_loss = total_loss / max(num_batches, 1)
 
@@ -713,7 +732,7 @@ def main():
     parser.add_argument("--val_data_dir", type=str, default=None,
                         help="Directory with validation .nii.gz files (defaults to --data_dir)")
     parser.add_argument("--output_dir", type=str,
-                        default="./checkpoint_2")
+                        default="./checkpoint_f1")
     parser.add_argument("--encoder_name", type=str,
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=16)
@@ -737,6 +756,9 @@ def main():
                         help="Cap batches per epoch for faster iteration")
     parser.add_argument("--preprocess_dir", type=str, default=None,
                         help="Directory with preprocessed .pt volumes (from preprocess_volumes.py)")
+    parser.add_argument("--val_preprocess_dir", type=str, default=None,
+                        help="Directory with validation preprocessed .pt volumes "
+                             "(defaults to --preprocess_dir)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Resume from checkpoint")
     args = parser.parse_args()
@@ -794,9 +816,10 @@ def main():
     val_loader = None
     if args.val_labels_json:
         val_data_dir = args.val_data_dir or args.data_dir
+        val_preprocess_dir = args.val_preprocess_dir or args.preprocess_dir
         val_ds = CTMultiLabelDataset(
             val_data_dir, args.val_labels_json, slice_size, args.num_slices,
-            preprocess_dir=args.preprocess_dir,
+            preprocess_dir=val_preprocess_dir,
         )
         val_loader = DataLoader(
             val_ds, batch_size=args.batch_size, shuffle=False,
@@ -871,7 +894,7 @@ def main():
             # (e.g. pneumothorax 20 pos / 5000 neg → raw weight 250 destabilises training).
             # A cap of 10 still strongly upweights rare positives without causing
             # gradient explosion or pushing logits to ±inf in early epochs.
-            pos_weight[i] = min(n_neg / n_pos, 10.0)
+            pos_weight[i] = min(max(n_neg / n_pos, 1.0), 10.0)
         else:
             pos_weight[i] = 1.0  # fallback if no positives
     for i, task in enumerate(RADIOLOGICAL_TASKS):

@@ -33,7 +33,9 @@ python train_hypernet.py \
     --labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
     --val_labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
     --val_data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/valid_fixed \
-    --output_dir ./checkpoint_2 \
+    --preprocess_dir /midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT/preprocessed_train \
+    --val_preprocess_dir /midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT/preprocessed_valid \
+    --output_dir ./checkpoint_f1 \
     --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
     --lora_rank 16 \
     --lora_scaling 1.0 \
@@ -44,8 +46,8 @@ python train_hypernet.py \
     --cube_pool_levels 2 \
     --lr 1e-5 \
     --weight_decay 1e-2 \
-    --epochs 5 \
-    --early_stop_patience 3 \
+    --epochs 8 \
+    --early_stop_patience 4 \
     --num_workers 4 \
     --max_batches_per_epoch 5000 \
     --seed 42
